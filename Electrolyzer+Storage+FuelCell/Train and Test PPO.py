@@ -113,4 +113,5 @@ if __name__ == "__main__":
         print("Warning: 'price_after_MAD_96.pkl' not found. Using synthetic data.")
 
     trained_model = train()
+
     test(trained_model)
