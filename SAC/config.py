@@ -3,56 +3,56 @@ import os
 
 
 class Config:
-    # --- 路径配置 ---
-    # 使用原始字符串 r"..." 避免 Windows 路径报错
+    # --- 路径配置 (使用 r 前缀处理 Windows 路径) ---
+    # 请确保这些路径指向你的实际文件位置
     path_price = r"E:\桌面图标\Graduation Thesis\Hydrogen\HydrogenChargingHub\price_after_MAD_96.pkl"
     path_pv = r"E:\桌面图标\Graduation Thesis\Hydrogen\HydrogenChargingHub\pv_power_100.pkl"
     path_wind = r"E:\桌面图标\Graduation Thesis\Hydrogen\HydrogenChargingHub\wd_power_150.pkl"
 
     # --- 全局模拟参数 ---
-    dt = 0.25  # 15分钟一个点
+    dt = 0.25  # 15分钟一个点 (0.25小时)
     steps_per_day = 96
     episode_length = 96  # 训练一个回合代表一天
 
     # --- I2S (Identical Initial State) 约束参数 ---
     enable_i2s_constraint = True
-    # [修改] 大幅提高惩罚权重，强迫 SOC 回归，解决 SOC 持续下降问题
-    i2s_penalty_weight = 200.0
+
+    # [关键修改] 大幅提高惩罚权重
+    # 逻辑: 满罐氢气价值约 $5000 (500kg * $10).
+    # 如果 Agent 偷光氢气 (偏差0.5), 惩罚必须远大于 $5000.
+    # 设为 10000.0 可以确保 Agent 即使在探索初期也不敢随意违背 I2S 约束.
+    i2s_penalty_weight = 10000.0
 
     # --- 物理组件参数 ---
-    # 电解槽
+    # 1. 电解槽
     ele_max_power = 1000.0  # kW
     ele_efficiency = 50.0  # kWh/kg
 
-    # 压缩机
+    # 2. 级联压缩机 (Cascade Compressor - 论文 Eq.10)
     comp_efficiency = 0.75
-    comp_input_pressure = 30.0  # bar
+    comp_input_pressure = 1.0  # bar
     comp_output_pressure = 350.0  # bar
     H2_gamma = 1.41
     H2_R = 4124.0
-    T_ambient = 298.15
+    H2_molar_mass = 2.016
+    T_in = 298.15
 
-    # 储氢罐
+    # 3. 储氢罐
     storage_capacity_kg = 500.0
     storage_min_level = 0.05
     storage_max_level = 0.95
-    storage_initial = 0.5  # I2S 目标值
+    storage_initial = 0.5  # I2S 目标 SOC
 
-    # 燃料电池
+    # 4. 燃料电池
     fc_max_power = 500.0
     fc_efficiency = 16.0  # kWh/kg
 
-    # 冷却机
+    # 5. 冷却机 (Chiller - 新增)
     chiller_cop = 3.0
-    gas_heat_capacity = 14.3
-    target_temp = 253.15
+    gas_heat_capacity = 14.3  # kJ/(kg*K)
+    target_temp = 298.15  # K (冷却回常温)
 
-    # 经济参数
-    # [修改] 降低氢气价格 (60 -> 10)，使 FC 发电在电价高峰期具有竞争力，否则 Agent 只会卖氢气不发电
+    # 6. 经济参数
     hydrogen_price = 10.0  # $/kg
-
-    # [修改] 提高卖电系数，鼓励向电网反送电
     electricity_price_sell_coef = 1.0
-
-    # [修改] 提高缺氢惩罚，防止 SOC 耗尽
-    penalty_unmet_demand = 500.0
+    penalty_unmet_demand = 500.0  # 缺氢惩罚

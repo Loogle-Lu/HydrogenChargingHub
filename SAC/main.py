@@ -6,57 +6,50 @@ from config import Config
 
 
 def plot_results(rewards, profits, soc_history, power_balance):
-    """
-    绘制四张图表
-    P3: SOC 应在初始值附近波动，如果下降说明产氢不足
-    P4: 负值代表消耗（制氢），正值代表产生（光伏/风电/FC）
-    """
-    # 支持中文显示 (如果你的系统支持 SimHei)
     plt.rcParams['axes.unicode_minus'] = False
 
     fig, axs = plt.subplots(2, 2, figsize=(15, 10))
 
-    # 1. 训练 Reward
+    # 1. Training Reward
     axs[0, 0].plot(rewards)
-    axs[0, 0].set_title("Training Reward Curve")
+    axs[0, 0].set_title("Training Reward Curve (Clipped Gradient)")
     axs[0, 0].set_xlabel("Episode")
     axs[0, 0].set_ylabel("Total Reward")
 
-    # 2. 累计利润
+    # 2. Cumulative Profit
     cum_profit = np.cumsum(profits)
     axs[0, 1].plot(cum_profit, color='green')
     axs[0, 1].set_title("Cumulative Profit (Last Episode)")
     axs[0, 1].set_ylabel("Profit ($)")
 
-    # 3. SOC 曲线
+    # 3. SOC History
     axs[1, 0].plot(soc_history, color='orange', label='SOC')
     axs[1, 0].axhline(y=Config.storage_initial, color='r', linestyle='--', label='Initial Target')
-    axs[1, 0].set_title("H2 Storage Level (Should Return to Target)")
+    axs[1, 0].set_title("H2 Storage Level (Should Match Target)")
     axs[1, 0].set_ylim(0, 1.0)
     axs[1, 0].legend()
 
-    # 4. 氢电平衡
+    # 4. Energy Balance
     steps = range(len(power_balance['re']))
     re_gen = np.array(power_balance['re'])
     grid_power = np.array(power_balance['net'])
     fc_power = np.array(power_balance['fc'])
     load_power = np.array(power_balance['load'])
 
-    # 注意：这里 -load_power 表示负荷在x轴下方，符合能源平衡图习惯
     axs[1, 1].plot(steps, re_gen, label='RE Gen (+)', alpha=0.5)
     axs[1, 1].plot(steps, fc_power, label='Fuel Cell (+)', color='purple', linewidth=2)
-    axs[1, 1].plot(steps, -load_power, label='H2 Prod Load (-)', color='red', alpha=0.5)
+    axs[1, 1].plot(steps, -load_power, label='Total Load (-)', color='red', alpha=0.5)
 
     axs[1, 1].fill_between(steps, grid_power, 0, where=(grid_power < 0), color='gray', alpha=0.3,
                            label='Grid Import (-)')
     axs[1, 1].fill_between(steps, grid_power, 0, where=(grid_power > 0), color='green', alpha=0.3,
                            label='Grid Export (+)')
 
-    axs[1, 1].set_title("Energy Balance (Pos=Gen, Neg=Load)")
+    axs[1, 1].set_title("Energy Balance (Prod+Comp+Chill)")
     axs[1, 1].legend(loc='upper right', fontsize='small')
 
     plt.tight_layout()
-    print("Plotting results... Close window to finish.")
+    print("Plotting results...")
     plt.show()
 
 
@@ -68,8 +61,7 @@ def train():
     agent = SAC(state_dim, action_dim)
     replay_buffer = ReplayBuffer(capacity=100000, state_dim=state_dim, action_dim=action_dim)
 
-    # [修改] 增加训练回合数，给 Agent 更多时间学习复杂的 I2S 和 FC 策略
-    num_episodes = 1000
+    num_episodes = 200
     batch_size = 64
     all_rewards = []
 
@@ -77,7 +69,7 @@ def train():
     last_episode_soc = []
     last_episode_power = {'re': [], 'net': [], 'fc': [], 'load': []}
 
-    print("Start Training Hydrogen Project...")
+    print("Start Training Hydrogen Project (SAC + Gradient Clipping)...")
 
     for episode in range(num_episodes):
         state = env.reset()

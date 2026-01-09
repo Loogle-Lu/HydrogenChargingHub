@@ -4,6 +4,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 
+
 class ReplayBuffer:
     def __init__(self, capacity, state_dim, action_dim):
         self.capacity = capacity
@@ -34,6 +35,7 @@ class ReplayBuffer:
             torch.FloatTensor(self.done[ind])
         )
 
+
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(Actor, self).__init__()
@@ -61,6 +63,7 @@ class Actor(nn.Module):
         log_prob = log_prob.sum(1, keepdim=True)
         return action, log_prob
 
+
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(Critic, self).__init__()
@@ -76,6 +79,7 @@ class Critic(nn.Module):
         q1 = F.relu(self.l3(F.relu(self.l2(F.relu(self.l1(sa))))))
         q2 = F.relu(self.l6(F.relu(self.l5(F.relu(self.l4(sa))))))
         return q1, q2
+
 
 class SAC:
     def __init__(self, state_dim, action_dim, gamma=0.99, tau=0.005, alpha=0.2, lr=3e-4):
@@ -96,6 +100,7 @@ class SAC:
 
     def update(self, replay_buffer, batch_size=64):
         state, action, reward, next_state, done = replay_buffer.sample(batch_size)
+
         with torch.no_grad():
             next_action, next_log_prob = self.actor.sample(next_state)
             target_Q1, target_Q2 = self.critic_target(next_state, next_action)
@@ -104,17 +109,25 @@ class SAC:
 
         current_Q1, current_Q2 = self.critic(state, action)
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        # [核心修复] 梯度裁剪 (Gradient Clipping)
+        # 限制梯度范数最大为 1.0，防止因 I2S 巨大惩罚导致梯度爆炸和训练震荡
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
         action_new, log_prob_new = self.actor.sample(state)
         Q1_new, Q2_new = self.critic(state, action_new)
         Q_new = torch.min(Q1_new, Q2_new)
         actor_loss = (self.alpha * log_prob_new - Q_new).mean()
+
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        # [核心修复] 对 Actor 也进行梯度裁剪
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
 
+        # Soft update
         for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)

@@ -3,34 +3,84 @@ from config import Config
 
 
 class Electrolyzer:
+    """线性电解槽: 输入功率 -> 产氢量"""
+
     def __init__(self):
         self.max_power = Config.ele_max_power
         self.efficiency = Config.ele_efficiency
 
     def compute(self, power_input):
         power = np.clip(power_input, 0, self.max_power)
-        # kWh/kg -> kg/h:  Power(kW) / Efficiency(kWh/kg) = kg/h
-        h2_flow_kg = power / self.efficiency
+        h2_flow_kg = power / self.efficiency  # kg/h
         return h2_flow_kg, power
 
 
 class CascadeCompressor:
+    """
+    两级压缩机 (Two-stage Compressor)
+    基于论文 Eq. (10) 实现
+    """
+
     def __init__(self):
         self.eta = Config.comp_efficiency
-        self.cp = Config.H2_gamma / (Config.H2_gamma - 1) * Config.H2_R
+        self.gamma = Config.H2_gamma
+        self.R = Config.H2_R
+        self.T = Config.T_in
 
-    def compute_power(self, mass_flow):
-        if mass_flow <= 0: return 0.0, 0.0
-        p_ratio = Config.comp_output_pressure / Config.comp_input_pressure
-        exponent = (Config.H2_gamma - 1) / Config.H2_gamma
-        work_per_kg = self.cp * Config.T_ambient * (pow(p_ratio, exponent) - 1)
-        # mass_flow is kg/h, convert to kg/s for Watt calculation, then to kW
-        power_kw = (work_per_kg * mass_flow / 3600.0) / 1000.0 / self.eta
+        # 压力参数
+        self.P1 = Config.comp_input_pressure
+        self.P3 = Config.comp_output_pressure
+        # 最佳中间压力 P2 = sqrt(P1 * P3)
+        self.P2 = np.sqrt(self.P1 * self.P3)
 
-        t_out = Config.T_ambient * (1 + (pow(p_ratio, exponent) - 1) / self.eta)
-        heat_load_j_kg = Config.gas_heat_capacity * 1000 * (t_out - Config.target_temp)
-        total_heat_load_kw = (heat_load_j_kg * mass_flow / 3600.0) / 1000.0
-        return power_kw, max(0, total_heat_load_kw)
+        # 预计算常数部分
+        self.exponent = (self.gamma - 1) / self.gamma
+        self.cp = self.gamma * self.R / (self.gamma - 1)
+
+    def compute_power(self, mass_flow_kg_h):
+        """
+        计算压缩功耗和产生的热量
+        """
+        if mass_flow_kg_h <= 0: return 0.0, 0.0
+
+        m_dot = mass_flow_kg_h / 3600.0  # kg/s
+
+        # 第一级压缩 P1 -> P2
+        term1 = (self.P2 / self.P1) ** self.exponent - 1
+        work_stage1 = self.cp * self.T * term1 / self.eta
+
+        # 第二级压缩 P2 -> P3
+        term2 = (self.P3 / self.P2) ** self.exponent - 1
+        work_stage2 = self.cp * self.T * term2 / self.eta
+
+        # 总功耗 (kW)
+        total_work_j_kg = work_stage1 + work_stage2
+        power_kw = m_dot * total_work_j_kg / 1000.0
+
+        # 热负荷计算 (用于 Chiller)
+        # 计算出口温度带来的显热增加
+        t_out_1 = self.T * (1 + term1 / self.eta)
+        t_out_2 = self.T * (1 + term2 / self.eta)
+
+        heat_1 = m_dot * self.cp * (t_out_1 - Config.target_temp)
+        heat_2 = m_dot * self.cp * (t_out_2 - Config.target_temp)
+
+        total_heat_kw = (heat_1 + heat_2) / 1000.0
+
+        return power_kw, max(0, total_heat_kw)
+
+
+class Chiller:
+    """
+    冷却机: 根据 COP 计算移除热量所需的电能
+    """
+
+    def __init__(self):
+        self.cop = Config.chiller_cop
+
+    def compute_power(self, heat_load_kw):
+        if heat_load_kw <= 0: return 0.0
+        return heat_load_kw / self.cop
 
 
 class CascadeStorage:
@@ -41,7 +91,6 @@ class CascadeStorage:
         self.max_lvl = Config.storage_max_level * self.capacity
 
     def step(self, inflow, outflow):
-        # inflow/outflow: kg/h -> delta: kg
         delta = (inflow - outflow) * Config.dt
         new_level = self.level + delta
         excess = 0.0
@@ -65,19 +114,7 @@ class FuelCell:
         self.efficiency = Config.fc_efficiency
 
     def compute(self, h2_input_kg):
-        # h2_input_kg is flow rate in kg/h
-        # Efficiency is kWh/kg. Power = Flow(kg/h) * Eff(kWh/kg) = kW
         power_generated = h2_input_kg * self.efficiency
         actual_power = min(power_generated, self.max_power)
-
-        # Recalculate consumed H2 based on actual power limited
         consumed_h2 = actual_power / self.efficiency
         return actual_power, consumed_h2
-
-
-class Chiller:
-    def __init__(self):
-        self.cop = Config.chiller_cop
-
-    def compute_power(self, heat_load_kw):
-        return heat_load_kw / self.cop
