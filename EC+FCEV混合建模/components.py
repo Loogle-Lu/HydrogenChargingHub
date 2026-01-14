@@ -3,16 +3,92 @@ from config import Config
 
 
 class Electrolyzer:
-    """线性电解槽: 输入功率 -> 产氢量"""
+    """
+    线性电解槽: 输入功率 -> 产氢量
+    支持可变功率阈值策略，区分绿氢和灰氢生产
+    """
 
     def __init__(self):
         self.max_power = Config.ele_max_power
         self.efficiency = Config.ele_efficiency
+        
+        # 绿氢生产统计
+        self.total_green_h2 = 0.0  # kg
+        self.total_grid_h2 = 0.0   # kg
+        self.total_green_energy = 0.0  # kWh
+        self.total_grid_energy = 0.0   # kWh
 
-    def compute(self, power_input):
+    def compute(self, power_input, re_available=0.0, power_threshold=None):
+        """
+        计算产氢量，并区分绿氢和灰氢
+        
+        参数:
+        - power_input: 目标输入功率 (kW)
+        - re_available: 可用可再生能源功率 (kW)
+        - power_threshold: 功率阈值 (kW)，超过此值优先使用RE
+        
+        返回:
+        - h2_flow_kg: 产氢量 (kg/h)
+        - actual_power: 实际功率 (kW)
+        - green_h2_ratio: 绿氢占比 (0-1)
+        - power_from_re: 来自可再生能源的功率 (kW)
+        - power_from_grid: 来自电网的功率 (kW)
+        """
+        # 限制在最大功率范围内
         power = np.clip(power_input, 0, self.max_power)
-        h2_flow_kg = power / self.efficiency  # kg/h
-        return h2_flow_kg, power
+        
+        if not Config.enable_threshold_strategy or power_threshold is None:
+            # 不启用阈值策略，正常运行
+            h2_flow_kg = power / self.efficiency
+            return h2_flow_kg, power, 0.0, 0.0, power
+        
+        # 应用阈值策略
+        if re_available >= power_threshold:
+            # 可再生能源充足，优先使用RE生产绿氢
+            power_from_re = min(power, re_available)
+            power_from_grid = max(0, power - power_from_re)
+        else:
+            # 可再生能源不足阈值，可以使用电网能源
+            # 但仍优先使用可用的RE
+            power_from_re = min(power, re_available)
+            power_from_grid = power - power_from_re
+        
+        # 计算绿氢和灰氢产量
+        green_h2_flow = power_from_re / self.efficiency  # kg/h
+        grid_h2_flow = power_from_grid / self.efficiency  # kg/h
+        total_h2_flow = green_h2_flow + grid_h2_flow
+        
+        # 计算绿氢占比
+        green_h2_ratio = power_from_re / power if power > 0 else 0.0
+        
+        # 累积统计 (假设dt=Config.dt)
+        self.total_green_h2 += green_h2_flow * Config.dt
+        self.total_grid_h2 += grid_h2_flow * Config.dt
+        self.total_green_energy += power_from_re * Config.dt
+        self.total_grid_energy += power_from_grid * Config.dt
+        
+        return total_h2_flow, power, green_h2_ratio, power_from_re, power_from_grid
+    
+    def get_statistics(self):
+        """获取绿氢生产统计"""
+        total_h2 = self.total_green_h2 + self.total_grid_h2
+        green_h2_percentage = (self.total_green_h2 / total_h2 * 100) if total_h2 > 0 else 0.0
+        
+        return {
+            'total_green_h2_kg': self.total_green_h2,
+            'total_grid_h2_kg': self.total_grid_h2,
+            'total_h2_kg': total_h2,
+            'green_h2_percentage': green_h2_percentage,
+            'total_green_energy_kwh': self.total_green_energy,
+            'total_grid_energy_kwh': self.total_grid_energy
+        }
+    
+    def reset(self):
+        """重置统计数据"""
+        self.total_green_h2 = 0.0
+        self.total_grid_h2 = 0.0
+        self.total_green_energy = 0.0
+        self.total_grid_energy = 0.0
 
 
 class Compressor:
