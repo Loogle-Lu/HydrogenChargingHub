@@ -42,6 +42,7 @@ class HydrogenEnv(gym.Env):
         self.chiller.reset()  # 重置冷却机状态
         self.service_station = IntegratedServiceStation()  # 重置服务站
         self.demand_generator = MixedDemandGenerator()  # 重置需求生成器
+        self.ele.reset()  # 重置电解槽统计
         
         self.current_data = self.data_loader.get_step_data(self.current_step)
 
@@ -60,6 +61,44 @@ class HydrogenEnv(gym.Env):
             hour_of_day / 24.0  # 时段归一化 (0-1)
         ], dtype=np.float32)
         return self.state
+    
+    def _compute_dynamic_threshold(self, price, soc, re_power):
+        """
+        计算动态功率阈值
+        
+        阈值策略:
+        1. 电价高时，提高阈值 (更倾向使用RE)
+        2. 储氢量低时，降低阈值 (加快制氢)
+        3. RE功率高时，适当降低阈值 (更充分利用RE)
+        
+        返回: 动态阈值 (kW)
+        """
+        if not Config.enable_threshold_strategy:
+            return 0.0
+        
+        # 基准阈值
+        threshold = Config.base_power_threshold
+        
+        # 电价调整 (电价越高，阈值越高，更倾向用RE)
+        price_adjustment = (price - 0.08) * Config.threshold_price_coef
+        
+        # SOC调整 (SOC越低，阈值越低，加快制氢)
+        soc_adjustment = -(0.5 - soc) * Config.threshold_soc_coef
+        
+        # RE可用性调整 (RE越充足，阈值稍降低以充分利用)
+        re_adjustment = -min(re_power / Config.ele_max_power, 1.0) * 50.0
+        
+        # 综合调整
+        dynamic_threshold = threshold + price_adjustment + soc_adjustment + re_adjustment
+        
+        # 限制在合理范围
+        dynamic_threshold = np.clip(
+            dynamic_threshold,
+            Config.min_power_threshold,
+            Config.max_power_threshold
+        )
+        
+        return dynamic_threshold
 
     def step(self, action):
         ele_ratio = np.clip(action[0], 0, 1)
@@ -73,20 +112,25 @@ class HydrogenEnv(gym.Env):
         ev_arrivals, fcev_arrivals = self.demand_generator.generate_vehicles(self.current_step)
         self.service_station.add_vehicles(ev_arrivals, fcev_arrivals)
 
-        # --- 2. 制氢 (Electrolyzer -> T1) ---
+        # --- 2. 计算动态功率阈值 ---
+        current_soc = self.storage.get_total_soc()
+        power_threshold = self._compute_dynamic_threshold(price, current_soc, re_gen)
+
+        # --- 3. 制氢 (Electrolyzer -> T1) - 应用阈值策略 ---
         ele_power_target = ele_ratio * Config.ele_max_power
-        h2_produced, ele_actual_power = self.ele.compute(ele_power_target)
+        h2_produced, ele_actual_power, green_h2_ratio, power_from_re, power_from_grid = \
+            self.ele.compute(ele_power_target, re_gen, power_threshold)
         
-        # --- 3. 计算可用氢气 (用于FCEV加氢) ---
+        # --- 4. 计算可用氢气 (用于FCEV加氢) ---
         # 从T3系统获取可用氢气量
         t3_available_h2 = (self.storage.t3_1.level + self.storage.t3_2.level + 
                           self.storage.t3_3.level) * 0.8  # 80%可用于加氢
         
-        # --- 4. 服务EV/FCEV需求 ---
+        # --- 5. 服务EV/FCEV需求 ---
         ev_power_demand, fcev_h2_demand, ev_revenue, fcev_revenue, service_penalty = \
             self.service_station.step(price, t3_available_h2, Config.dt)
         
-        # --- 5. 多级压缩链 ---
+        # --- 6. 多级压缩链 ---
         t1_soc = self.storage.t1.get_soc()
         t2_soc = self.storage.t2.get_soc()
         
@@ -104,16 +148,16 @@ class HydrogenEnv(gym.Env):
         
         total_comp_heat = c1_heat + c2_heat + c3_heat
         
-        # --- 6. 非线性Chiller ---
+        # --- 7. 非线性Chiller ---
         chiller_power = self.chiller.compute_power(total_comp_heat)
         
-        # --- 7. 总电力负荷 ---
+        # --- 8. 总电力负荷 ---
         # 制氢链负荷
         h2_production_load = ele_actual_power + c1_power + c2_power + c3_power + chiller_power
         # EV充电负荷
         total_load = h2_production_load + ev_power_demand
 
-        # --- 8. 多储罐系统更新 ---
+        # --- 9. 多储罐系统更新 ---
         soc, excess_h2, shortage_h2 = self.storage.step_all(
             h2_from_ele=h2_produced,
             h2_to_c1=c1_flow,
@@ -125,7 +169,7 @@ class HydrogenEnv(gym.Env):
             h2_from_c3=c3_flow
         )
 
-        # --- 9. 燃料电池发电 (应对高负荷或高电价) ---
+        # --- 10. 燃料电池发电 (应对高负荷或高电价) ---
         fc_power_target = fc_ratio * Config.fc_max_power
         h2_needed_for_fc = fc_power_target / self.fc.efficiency
         
@@ -140,13 +184,21 @@ class HydrogenEnv(gym.Env):
         real_fc_h2_used = h2_needed_for_fc * supply_ratio
         fc_actual_power, _ = self.fc.compute(real_fc_h2_used)
 
-        # --- 10. 电网互动与财务 ---
+        # --- 11. 电网互动与财务 (含绿氢奖励) ---
         # 电力平衡: 供应 - 需求
-        net_power = (fc_actual_power + re_gen) - total_load
+        # 注意: 电解槽消耗的RE已经在power_from_re中体现，不重复计算
+        available_re_for_grid = re_gen - power_from_re  # 剩余可再生能源
+        net_power = (fc_actual_power + available_re_for_grid) - (total_load - ele_actual_power)
 
         # 收入来源
         revenue_ev = ev_revenue  # EV充电收入
         revenue_fcev = fcev_revenue  # FCEV加氢收入
+        
+        # 绿氢奖励 (鼓励使用可再生能源制氢)
+        green_h2_bonus = 0.0
+        if Config.enable_threshold_strategy:
+            green_h2_produced_this_step = (power_from_re / Config.ele_efficiency) * Config.dt
+            green_h2_bonus = green_h2_produced_this_step * Config.green_hydrogen_bonus
         
         # 电力成本/收入
         cost_grid = 0
@@ -165,9 +217,9 @@ class HydrogenEnv(gym.Env):
         if excess_h2 > 0: 
             penalty += excess_h2 * 10
 
-        # 总收益
-        step_reward = revenue_ev + revenue_fcev + revenue_grid - cost_grid - penalty
-        step_profit = revenue_ev + revenue_fcev + revenue_grid - cost_grid
+        # 总收益 (包含绿氢奖励)
+        step_reward = revenue_ev + revenue_fcev + revenue_grid + green_h2_bonus - cost_grid - penalty
+        step_profit = revenue_ev + revenue_fcev + revenue_grid + green_h2_bonus - cost_grid
 
         self.current_step += 1
         done = self.current_step >= Config.episode_length
@@ -218,6 +270,13 @@ class HydrogenEnv(gym.Env):
             "ev_queue": station_stats['ev_queue_length'],
             "fcev_queue": station_stats['fcev_queue_length'],
             "vehicles_delayed": station_stats['vehicles_delayed'],
+            # 绿氢策略统计
+            "power_threshold": power_threshold,
+            "green_h2_ratio": green_h2_ratio,
+            "power_from_re": power_from_re,
+            "power_from_grid": power_from_grid,
+            "green_h2_bonus": green_h2_bonus,
+            "ele_power": ele_actual_power,
             # 兼容旧版
             "h2_sold": fcev_h2_demand * supply_ratio  # 近似值
         }

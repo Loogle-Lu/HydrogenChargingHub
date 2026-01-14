@@ -27,6 +27,26 @@ class Config:
     # 1. 电解槽
     ele_max_power = 1000.0  # kW
     ele_efficiency = 50.0  # kWh/kg
+    
+    # 1.1 可变功率阈值策略 (Variable Power Threshold Strategy)
+    # 目标: 最大化绿氢生产，优先利用可再生能源
+    enable_threshold_strategy = True
+    
+    # 动态阈值参数
+    # 当 RE_available > threshold 时，生产绿氢
+    # 当 RE_available < threshold 时，可使用电网能源
+    base_power_threshold = 200.0  # kW (基准阈值)
+    
+    # 阈值调整系数 (基于电价和储氢量动态调整)
+    threshold_price_coef = 500.0  # 电价影响系数 (高电价时提高阈值)
+    threshold_soc_coef = 200.0  # SOC影响系数 (低储氢时降低阈值)
+    
+    # 绿氢优先级权重 (奖励使用可再生能源制氢)
+    green_hydrogen_bonus = 2.0  # $/kg (绿氢额外奖励)
+    
+    # 阈值范围限制
+    min_power_threshold = 100.0  # kW (最小阈值)
+    max_power_threshold = 800.0  # kW (最大阈值)
 
     # 2. 多级级联压缩机系统 (Multi-Stage Cascade Compressor System)
     # 公共压缩机参数
