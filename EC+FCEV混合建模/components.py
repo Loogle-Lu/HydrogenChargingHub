@@ -572,40 +572,75 @@ class FCEVehicle(Vehicle):
 class MixedDemandGenerator:
     """
     混合需求生成器 (EV + FCEV)
-    模拟真实车辆到达模式，考虑时段变化
+    基于真实用户行为模式的高级需求模拟
     """
     def __init__(self):
         self.vehicle_id_counter = 0
         self.ev_fcev_ratio = Config.ev_fcev_ratio
+        self.current_day = 0  # 追踪天数用于周模式
         
-    def _get_time_multiplier(self, hour_of_day):
-        """根据时段获取到达率倍数"""
-        if hour_of_day in Config.peak_morning_hours or hour_of_day in Config.peak_evening_hours:
-            return Config.peak_arrival_multiplier
+    def _get_time_multiplier(self, hour_of_day, day_of_week=None):
+        """
+        根据时段和星期获取到达率倍数
+        考虑真实用户行为模式
+        """
+        # 基础时段系数
+        if hour_of_day in Config.peak_morning_hours:
+            # 早高峰 (7-9AM): 通勤充电
+            base_multiplier = Config.peak_arrival_multiplier * 1.2
+        elif hour_of_day in Config.peak_evening_hours:
+            # 晚高峰 (5-7PM): 下班充电
+            base_multiplier = Config.peak_arrival_multiplier * 1.0
         elif hour_of_day in Config.midday_hours:
-            return Config.midday_multiplier
+            # 午间 (12-2PM): 中等需求
+            base_multiplier = Config.midday_multiplier
         elif hour_of_day in Config.offpeak_hours:
-            return Config.offpeak_multiplier
+            # 深夜/凌晨 (11PM-6AM): 低需求
+            base_multiplier = Config.offpeak_multiplier
         else:
-            return 1.0
+            # 其他时段
+            base_multiplier = 1.0
+        
+        # 星期模式修正
+        if day_of_week is not None:
+            if day_of_week >= 5:  # 周末 (5=周六, 6=周日)
+                # 周末需求分布更平均，峰值降低
+                if hour_of_day in Config.peak_morning_hours:
+                    base_multiplier *= 0.6  # 周末早高峰需求降低
+                elif 10 <= hour_of_day <= 20:  # 周末白天需求分散
+                    base_multiplier *= 1.3
+            else:  # 工作日 (0-4)
+                if hour_of_day in Config.peak_morning_hours or hour_of_day in Config.peak_evening_hours:
+                    base_multiplier *= 1.1  # 工作日峰值更明显
+        
+        # 添加小幅随机波动 (±15%)
+        random_factor = np.random.uniform(0.85, 1.15)
+        
+        return base_multiplier * random_factor
     
     def generate_vehicles(self, current_step):
         """
         生成当前时段到达的车辆
+        基于真实用户行为模式，考虑时段、星期、价格等因素
         
         返回:
         - ev_list: EV列表
         - fcev_list: FCEV列表
         """
-        # 计算当前时刻
+        # 计算当前时刻和星期
         hour_of_day = int((current_step * Config.dt) % 24)
+        day_of_year = int(current_step / 96)  # 第几天
+        day_of_week = day_of_year % 7  # 星期几 (0=周一, 6=周日)
         
         # 调整到达率
-        time_multiplier = self._get_time_multiplier(hour_of_day)
+        time_multiplier = self._get_time_multiplier(hour_of_day, day_of_week)
         adjusted_arrival_rate = Config.base_vehicle_arrival_rate * time_multiplier
         
         # 泊松分布生成到达车辆数
-        num_arrivals = np.random.poisson(adjusted_arrival_rate * Config.dt)
+        # 添加最小和最大限制，避免极端情况
+        mean_arrivals = adjusted_arrival_rate * Config.dt
+        num_arrivals = np.random.poisson(mean_arrivals)
+        num_arrivals = min(num_arrivals, 15)  # 单个时段最多15辆车
         
         ev_list = []
         fcev_list = []
@@ -614,38 +649,99 @@ class MixedDemandGenerator:
             self.vehicle_id_counter += 1
             
             # 决定车辆类型
-            if np.random.random() < self.ev_fcev_ratio:
+            # EV/FCEV比例随时段微调
+            ev_ratio = self.ev_fcev_ratio
+            if hour_of_day in Config.peak_morning_hours:
+                # 早高峰EV占比稍高 (通勤)
+                ev_ratio = min(0.80, self.ev_fcev_ratio + 0.10)
+            elif hour_of_day in Config.offpeak_hours:
+                # 深夜FCEV占比稍高 (商用车)
+                ev_ratio = max(0.60, self.ev_fcev_ratio - 0.10)
+            
+            if np.random.random() < ev_ratio:
                 # 生成EV
-                ev = self._generate_ev(self.vehicle_id_counter, current_step)
+                ev = self._generate_ev(self.vehicle_id_counter, current_step, hour_of_day)
                 ev_list.append(ev)
             else:
                 # 生成FCEV
-                fcev = self._generate_fcev(self.vehicle_id_counter, current_step)
+                fcev = self._generate_fcev(self.vehicle_id_counter, current_step, hour_of_day)
                 fcev_list.append(fcev)
         
         return ev_list, fcev_list
     
-    def _generate_ev(self, vehicle_id, arrival_time):
-        """生成单个EV"""
-        # 电池容量
-        battery_capacity = np.clip(
-            np.random.normal(Config.ev_battery_capacity_mean, Config.ev_battery_capacity_std),
-            40.0, 100.0
-        )
+    def _generate_ev(self, vehicle_id, arrival_time, hour_of_day):
+        """
+        生成单个EV
+        基于真实用户行为模式，考虑时段对SOC和充电模式的影响
+        """
+        # 电池容量 (考虑车型分布)
+        # 小型车(40-50kWh): 30%, 中型车(60-70kWh): 50%, 大型车(80-100kWh): 20%
+        car_type_rand = np.random.random()
+        if car_type_rand < 0.30:
+            # 小型车
+            battery_capacity = np.random.uniform(40.0, 50.0)
+        elif car_type_rand < 0.80:
+            # 中型车
+            battery_capacity = np.random.normal(Config.ev_battery_capacity_mean, 5.0)
+        else:
+            # 大型车/SUV
+            battery_capacity = np.random.uniform(80.0, 100.0)
         
-        # 到站SOC
+        battery_capacity = np.clip(battery_capacity, 40.0, 100.0)
+        
+        # 到站SOC (根据时段调整分布)
+        if hour_of_day in Config.peak_morning_hours:
+            # 早高峰: 夜间充电后，SOC较高
+            soc_mean = 0.45
+            soc_std = 0.15
+        elif hour_of_day in Config.peak_evening_hours:
+            # 晚高峰: 一天使用后，SOC较低
+            soc_mean = 0.20
+            soc_std = 0.10
+        elif hour_of_day in Config.offpeak_hours:
+            # 深夜: 紧急充电，SOC很低
+            soc_mean = 0.15
+            soc_std = 0.08
+        else:
+            # 其他时段
+            soc_mean = Config.ev_soc_arrival_mean
+            soc_std = Config.ev_soc_arrival_std
+        
         soc_initial = np.clip(
-            np.random.normal(Config.ev_soc_arrival_mean, Config.ev_soc_arrival_std),
+            np.random.normal(soc_mean, soc_std),
             0.05, 0.80
         )
         
-        # 充电模式选择
+        # 充电模式选择 (根据时段和SOC调整)
         mode_rand = np.random.random()
-        if mode_rand < Config.ev_fast_charge_ratio:
+        
+        # 时段影响充电模式选择
+        fast_ratio = Config.ev_fast_charge_ratio
+        ultra_ratio = Config.ev_ultra_fast_ratio
+        
+        if hour_of_day in Config.peak_morning_hours or hour_of_day in Config.peak_evening_hours:
+            # 高峰期更多人选择快充
+            fast_ratio += 0.10
+            ultra_ratio += 0.03
+        elif hour_of_day in Config.offpeak_hours:
+            # 深夜更多人选择慢充
+            fast_ratio -= 0.15
+        
+        # SOC很低时倾向快充
+        if soc_initial < 0.15:
+            fast_ratio += 0.15
+            ultra_ratio += 0.05
+        
+        # 归一化概率
+        total = fast_ratio + ultra_ratio + Config.ev_slow_charge_ratio
+        fast_ratio /= total
+        ultra_ratio /= total
+        
+        if mode_rand < fast_ratio:
             charge_mode = 'fast'
             soc_target = Config.ev_soc_target_fast
             dr_flex = Config.ev_dr_flexibility_fast
-        elif mode_rand < Config.ev_fast_charge_ratio + Config.ev_ultra_fast_ratio:
+        elif mode_rand < fast_ratio + ultra_ratio:
             charge_mode = 'ultra_fast'
             soc_target = Config.ev_soc_target_fast
             dr_flex = Config.ev_dr_flexibility_fast * 0.5  # 超快充用户更不愿等待
@@ -659,18 +755,55 @@ class MixedDemandGenerator:
             soc_initial, soc_target, charge_mode, dr_flex
         )
     
-    def _generate_fcev(self, vehicle_id, arrival_time):
-        """生成单个FCEV"""
-        # 储氢罐容量 (基于Hyundai Nexo)
-        tank_capacity = Config.fcev_tank_capacity
+    def _generate_fcev(self, vehicle_id, arrival_time, hour_of_day):
+        """
+        生成单个FCEV
+        基于真实FCEV使用场景 (商用车为主)
+        """
+        # 储氢罐容量 (考虑车型分布)
+        # Hyundai Nexo: 6.3kg (70%)
+        # Toyota Mirai: 5.6kg (20%)
+        # 商用大车: 8-10kg (10%)
+        car_type_rand = np.random.random()
+        if car_type_rand < 0.70:
+            tank_capacity = Config.fcev_tank_capacity  # 6.3kg (Nexo)
+        elif car_type_rand < 0.90:
+            tank_capacity = 5.6  # Toyota Mirai
+        else:
+            tank_capacity = np.random.uniform(8.0, 10.0)  # 商用车
         
-        # 到站SOG (State of Gas)
+        # 到站SOG (State of Gas) - 根据时段和车型调整
+        if hour_of_day in Config.peak_morning_hours:
+            # 早高峰: 商用车开始一天工作，SOG中等
+            sog_mean = 0.35
+            sog_std = 0.12
+        elif hour_of_day in Config.peak_evening_hours:
+            # 晚高峰: 商用车结束工作，SOG较低
+            sog_mean = 0.18
+            sog_std = 0.08
+        elif 10 <= hour_of_day <= 16:
+            # 白天: 中途补充，SOG中等偏低
+            sog_mean = 0.25
+            sog_std = 0.10
+        else:
+            # 其他时段
+            sog_mean = Config.fcev_sog_arrival_mean
+            sog_std = Config.fcev_sog_arrival_std
+        
+        # 商用车SOG普遍更低 (使用强度大)
+        if tank_capacity > 7.0:  # 商用车
+            sog_mean *= 0.8
+        
         sog_initial = np.clip(
-            np.random.normal(Config.fcev_sog_arrival_mean, Config.fcev_sog_arrival_std),
+            np.random.normal(sog_mean, sog_std),
             0.05, 0.50
         )
         
-        sog_target = Config.fcev_sog_target
+        # 目标SOG (商用车倾向充更满)
+        if tank_capacity > 7.0:
+            sog_target = 0.98  # 商用车充到98%
+        else:
+            sog_target = Config.fcev_sog_target  # 乘用车95%
         
         return FCEVehicle(
             vehicle_id, arrival_time, tank_capacity,

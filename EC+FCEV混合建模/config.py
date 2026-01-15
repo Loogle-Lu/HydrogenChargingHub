@@ -17,11 +17,10 @@ class Config:
     # --- I2S (Identical Initial State) 约束参数 ---
     enable_i2s_constraint = True
 
-    # [关键修改] 大幅提高惩罚权重
-    # 逻辑: 满罐氢气价值约 $5000 (500kg * $10).
-    # 如果 Agent 偷光氢气 (偏差0.5), 惩罚必须远大于 $5000.
-    # 设为 10000.0 可以确保 Agent 即使在探索初期也不敢随意违背 I2S 约束.
-    i2s_penalty_weight = 10000.0
+    # [修改] 降低I2S惩罚权重，避免过度保守
+    # 原值10000导致Agent不敢制氢（害怕SOC偏离）
+    # 新值2000仍有约束作用，但允许更多探索
+    i2s_penalty_weight = 2000.0
 
     # --- 物理组件参数 ---
     # 1. 电解槽
@@ -35,18 +34,18 @@ class Config:
     # 动态阈值参数
     # 当 RE_available > threshold 时，生产绿氢
     # 当 RE_available < threshold 时，可使用电网能源
-    base_power_threshold = 200.0  # kW (基准阈值)
+    base_power_threshold = 100.0  # kW (降低基准阈值，更容易触发制氢)
     
     # 阈值调整系数 (基于电价和储氢量动态调整)
-    threshold_price_coef = 500.0  # 电价影响系数 (高电价时提高阈值)
-    threshold_soc_coef = 200.0  # SOC影响系数 (低储氢时降低阈值)
+    threshold_price_coef = 300.0  # 降低电价敏感度
+    threshold_soc_coef = 300.0  # 提高SOC敏感度，低SOC时更积极制氢
     
     # 绿氢优先级权重 (奖励使用可再生能源制氢)
-    green_hydrogen_bonus = 2.0  # $/kg (绿氢额外奖励)
+    green_hydrogen_bonus = 5.0  # $/kg (提高绿氢奖励，增强激励)
     
     # 阈值范围限制
-    min_power_threshold = 100.0  # kW (最小阈值)
-    max_power_threshold = 800.0  # kW (最大阈值)
+    min_power_threshold = 50.0  # kW (降低最小阈值)
+    max_power_threshold = 600.0  # kW (降低最大阈值)
 
     # 2. 多级级联压缩机系统 (Multi-Stage Cascade Compressor System)
     # 公共压缩机参数
@@ -221,6 +220,12 @@ class Config:
     # 11. 经济参数
     hydrogen_price = 10.0  # $/kg (生产成本)
     electricity_price_sell_coef = 1.0
+    
+    # 储能套利激励参数 (新增)
+    enable_arbitrage_bonus = True  # 启用储能套利奖励
+    arbitrage_bonus_coef = 100.0  # 套利奖励系数
+    price_threshold_low = 0.06  # $/kWh (低电价阈值，低于此值鼓励制氢)
+    price_threshold_high = 0.10  # $/kWh (高电价阈值，高于此值鼓励放电)
     
     # 惩罚参数
     penalty_unmet_h2_demand = 500.0  # $/kg 缺氢惩罚

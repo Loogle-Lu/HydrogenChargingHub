@@ -5,14 +5,16 @@ from sac import SAC, ReplayBuffer
 from config import Config
 
 
-def plot_results(rewards, profits, soc_history, power_balance, green_h2_stats=None):
+def plot_results(rewards, profits, soc_history, power_balance, green_h2_stats=None, arbitrage_stats=None):
     plt.rcParams['axes.unicode_minus'] = False
 
-    # 如果有绿氢统计，创建3x2布局，否则保持2x2
-    if green_h2_stats is not None:
-        fig, axs = plt.subplots(3, 2, figsize=(15, 15))
+    # 根据有无绿氢和套利统计决定布局
+    if green_h2_stats is not None and arbitrage_stats is not None:
+        fig, axs = plt.subplots(4, 2, figsize=(15, 20))  # 4行2列
+    elif green_h2_stats is not None or arbitrage_stats is not None:
+        fig, axs = plt.subplots(3, 2, figsize=(15, 15))  # 3行2列
     else:
-        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+        fig, axs = plt.subplots(2, 2, figsize=(15, 10))  # 2行2列
 
     # 1. Training Reward
     axs[0, 0].plot(rewards)
@@ -94,6 +96,52 @@ def plot_results(rewards, profits, soc_history, power_balance, green_h2_stats=No
         axs[2, 1].set_xlabel("Time Step")
         axs[2, 1].legend()
         axs[2, 1].grid(True, alpha=0.3)
+    
+    # 7. 储能套利行为分析 (如果启用)
+    if arbitrage_stats is not None and len(arbitrage_stats['price']) > 0:
+        steps = range(len(arbitrage_stats['price']))
+        price = np.array(arbitrage_stats['price'])
+        ele_power = np.array(arbitrage_stats['ele_power'])
+        fc_power = np.array(arbitrage_stats['fc_power'])
+        
+        # 归一化到0-1范围便于对比
+        price_norm = (price - price.min()) / (price.max() - price.min() + 1e-6)
+        ele_norm = ele_power / (Config.ele_max_power + 1e-6)
+        fc_norm = fc_power / (Config.fc_max_power + 1e-6)
+        
+        row_idx = 3 if green_h2_stats is not None else 2
+        
+        # 7a. 套利行为时间序列
+        axs[row_idx, 0].plot(steps, price_norm, color='red', linewidth=2, label='Price (norm)', alpha=0.7)
+        axs[row_idx, 0].plot(steps, ele_norm, color='blue', linewidth=1.5, label='Electrolyzer (norm)', alpha=0.7)
+        axs[row_idx, 0].plot(steps, fc_norm, color='purple', linewidth=1.5, label='Fuel Cell (norm)', alpha=0.7)
+        axs[row_idx, 0].axhline(y=Config.price_threshold_low/price.max(), color='green', 
+                               linestyle='--', alpha=0.5, label='Low Price Threshold')
+        axs[row_idx, 0].axhline(y=Config.price_threshold_high/price.max(), color='orange', 
+                               linestyle='--', alpha=0.5, label='High Price Threshold')
+        axs[row_idx, 0].set_title("Storage Arbitrage Behavior (Normalized)")
+        axs[row_idx, 0].set_ylabel("Normalized Value")
+        axs[row_idx, 0].set_xlabel("Time Step")
+        axs[row_idx, 0].legend(loc='upper right', fontsize='small')
+        axs[row_idx, 0].grid(True, alpha=0.3)
+        
+        # 7b. 套利奖励累积
+        arbitrage_bonus = np.array(arbitrage_stats['arbitrage_bonus'])
+        cum_arbitrage = np.cumsum(arbitrage_bonus)
+        
+        axs[row_idx, 1].plot(steps, cum_arbitrage, color='darkgreen', linewidth=2)
+        axs[row_idx, 1].fill_between(steps, 0, cum_arbitrage, color='darkgreen', alpha=0.3)
+        axs[row_idx, 1].set_title("Cumulative Arbitrage Bonus")
+        axs[row_idx, 1].set_ylabel("Cumulative Bonus ($)")
+        axs[row_idx, 1].set_xlabel("Time Step")
+        axs[row_idx, 1].grid(True, alpha=0.3)
+        
+        # 添加统计信息
+        total_arbitrage = cum_arbitrage[-1] if len(cum_arbitrage) > 0 else 0
+        axs[row_idx, 1].text(0.05, 0.95, f'Total: ${total_arbitrage:.2f}', 
+                            transform=axs[row_idx, 1].transAxes, 
+                            verticalalignment='top', fontsize=10,
+                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     plt.tight_layout()
     print("Plotting results...")
@@ -116,11 +164,15 @@ def train():
     last_episode_soc = []
     last_episode_power = {'re': [], 'net': [], 'fc': [], 'load': []}
     last_episode_green_h2 = {'green_ratio': [], 'threshold': [], 'power_from_re': [], 'power_from_grid': []}
+    last_episode_arbitrage = {'arbitrage_bonus': [], 'price': [], 'ele_power': [], 'fc_power': []}
 
-    print("Start Training Hydrogen Project (SAC + Variable Power Threshold Strategy)...")
+    print("Start Training Hydrogen Project (SAC + Storage Arbitrage Strategy)...")
     print(f"Green Hydrogen Strategy: {'Enabled' if Config.enable_threshold_strategy else 'Disabled'}")
+    print(f"Storage Arbitrage: {'Enabled' if Config.enable_arbitrage_bonus else 'Disabled'}")
     print(f"Base Threshold: {Config.base_power_threshold} kW")
     print(f"Green H2 Bonus: ${Config.green_hydrogen_bonus}/kg")
+    print(f"Arbitrage Coef: {Config.arbitrage_bonus_coef}")
+    print(f"I2S Penalty Weight: {Config.i2s_penalty_weight}")
     print("-" * 60)
 
     for episode in range(num_episodes):
@@ -133,6 +185,7 @@ def train():
             last_episode_soc = [state[0]]
             last_episode_power = {'re': [], 'net': [], 'fc': [], 'load': []}
             last_episode_green_h2 = {'green_ratio': [], 'threshold': [], 'power_from_re': [], 'power_from_grid': []}
+            last_episode_arbitrage = {'arbitrage_bonus': [], 'price': [], 'ele_power': [], 'fc_power': []}
 
         while not done:
             action = agent.select_action(state)
@@ -159,6 +212,13 @@ def train():
                     last_episode_green_h2['threshold'].append(info['power_threshold'])
                     last_episode_green_h2['power_from_re'].append(info['power_from_re'])
                     last_episode_green_h2['power_from_grid'].append(info['power_from_grid'])
+                
+                # 收集储能套利统计
+                if Config.enable_arbitrage_bonus:
+                    last_episode_arbitrage['arbitrage_bonus'].append(info['arbitrage_bonus'])
+                    last_episode_arbitrage['price'].append(info['price'])
+                    last_episode_arbitrage['ele_power'].append(info['ele_power'])
+                    last_episode_arbitrage['fc_power'].append(info['fc_power'])
 
         all_rewards.append(episode_reward)
         if (episode + 1) % 10 == 0:
@@ -181,8 +241,33 @@ def train():
         green_h2_stats = last_episode_green_h2 if len(last_episode_green_h2['green_ratio']) > 0 else None
     else:
         green_h2_stats = None
+    
+    # 打印储能套利统计
+    if Config.enable_arbitrage_bonus:
+        print("=" * 60)
+        print("STORAGE ARBITRAGE STATISTICS (Training Summary)")
+        print("=" * 60)
+        if len(last_episode_arbitrage['arbitrage_bonus']) > 0:
+            total_arbitrage_bonus = sum(last_episode_arbitrage['arbitrage_bonus'])
+            print(f"Total Arbitrage Bonus:    ${total_arbitrage_bonus:.2f}")
+            print(f"Average Bonus per Step:   ${total_arbitrage_bonus/len(last_episode_arbitrage['arbitrage_bonus']):.2f}")
+            
+            # 统计低价制氢和高价放电次数
+            low_price_electrolyze = sum(1 for i, p in enumerate(last_episode_arbitrage['price']) 
+                                       if p < Config.price_threshold_low and last_episode_arbitrage['ele_power'][i] > 100)
+            high_price_fuelcell = sum(1 for i, p in enumerate(last_episode_arbitrage['price']) 
+                                     if p > Config.price_threshold_high and last_episode_arbitrage['fc_power'][i] > 50)
+            
+            print(f"Low-Price Electrolyze:    {low_price_electrolyze} times")
+            print(f"High-Price Fuel Cell:     {high_price_fuelcell} times")
+        print("=" * 60 + "\n")
+        
+        arbitrage_stats = last_episode_arbitrage if len(last_episode_arbitrage['price']) > 0 else None
+    else:
+        arbitrage_stats = None
 
-    plot_results(all_rewards, last_episode_profits, last_episode_soc, last_episode_power, green_h2_stats)
+    plot_results(all_rewards, last_episode_profits, last_episode_soc, last_episode_power, 
+                green_h2_stats, arbitrage_stats)
 
 
 if __name__ == "__main__":

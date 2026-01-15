@@ -67,9 +67,9 @@ class HydrogenEnv(gym.Env):
         计算动态功率阈值
         
         阈值策略:
-        1. 电价高时，提高阈值 (更倾向使用RE)
-        2. 储氢量低时，降低阈值 (加快制氢)
-        3. RE功率高时，适当降低阈值 (更充分利用RE)
+        1. 电价低时，降低阈值 (鼓励低价时制氢储能)
+        2. 储氢量低时，大幅降低阈值 (加快制氢补充储氢)
+        3. RE功率高时，大幅降低阈值 (充分利用RE)
         
         返回: 动态阈值 (kW)
         """
@@ -79,14 +79,28 @@ class HydrogenEnv(gym.Env):
         # 基准阈值
         threshold = Config.base_power_threshold
         
-        # 电价调整 (电价越高，阈值越高，更倾向用RE)
-        price_adjustment = (price - 0.08) * Config.threshold_price_coef
+        # 电价调整 (电价越低，阈值越低，鼓励低价制氢)
+        # 低价时（<0.06）降低阈值，高价时（>0.10）提高阈值
+        if price < Config.price_threshold_low:
+            # 低电价，大幅降低阈值，鼓励制氢
+            price_adjustment = -(Config.price_threshold_low - price) * Config.threshold_price_coef * 2
+        elif price > Config.price_threshold_high:
+            # 高电价，提高阈值，减少制氢
+            price_adjustment = (price - Config.price_threshold_high) * Config.threshold_price_coef
+        else:
+            # 中等电价，小幅调整
+            price_adjustment = (price - 0.08) * Config.threshold_price_coef * 0.5
         
         # SOC调整 (SOC越低，阈值越低，加快制氢)
-        soc_adjustment = -(0.5 - soc) * Config.threshold_soc_coef
+        # 当SOC < 0.4时，大幅降低阈值
+        if soc < 0.4:
+            soc_adjustment = -(0.5 - soc) * Config.threshold_soc_coef * 2
+        else:
+            soc_adjustment = -(0.5 - soc) * Config.threshold_soc_coef
         
-        # RE可用性调整 (RE越充足，阈值稍降低以充分利用)
-        re_adjustment = -min(re_power / Config.ele_max_power, 1.0) * 50.0
+        # RE可用性调整 (RE越充足，阈值越低)
+        re_ratio = min(re_power / Config.ele_max_power, 1.0)
+        re_adjustment = -re_ratio * 100.0  # RE充足时大幅降低阈值
         
         # 综合调整
         dynamic_threshold = threshold + price_adjustment + soc_adjustment + re_adjustment
@@ -184,7 +198,7 @@ class HydrogenEnv(gym.Env):
         real_fc_h2_used = h2_needed_for_fc * supply_ratio
         fc_actual_power, _ = self.fc.compute(real_fc_h2_used)
 
-        # --- 11. 电网互动与财务 (含绿氢奖励) ---
+        # --- 11. 电网互动与财务 (含绿氢奖励 + 储能套利奖励) ---
         # 电力平衡: 供应 - 需求
         # 注意: 电解槽消耗的RE已经在power_from_re中体现，不重复计算
         available_re_for_grid = re_gen - power_from_re  # 剩余可再生能源
@@ -199,6 +213,25 @@ class HydrogenEnv(gym.Env):
         if Config.enable_threshold_strategy:
             green_h2_produced_this_step = (power_from_re / Config.ele_efficiency) * Config.dt
             green_h2_bonus = green_h2_produced_this_step * Config.green_hydrogen_bonus
+        
+        # 储能套利奖励 (新增: 鼓励低价制氢、高价放电)
+        arbitrage_bonus = 0.0
+        if Config.enable_arbitrage_bonus:
+            # 低价时制氢奖励
+            if price < Config.price_threshold_low and ele_actual_power > 0:
+                price_advantage = (Config.price_threshold_low - price) / Config.price_threshold_low
+                arbitrage_bonus += ele_actual_power * Config.dt * price_advantage * Config.arbitrage_bonus_coef
+            
+            # 高价时放电奖励
+            if price > Config.price_threshold_high and fc_actual_power > 0:
+                price_advantage = (price - Config.price_threshold_high) / Config.price_threshold_high
+                arbitrage_bonus += fc_actual_power * Config.dt * price_advantage * Config.arbitrage_bonus_coef
+            
+            # SOC健康度奖励（鼓励维持在合理范围）
+            soc_health_bonus = 0.0
+            if 0.4 <= current_soc <= 0.6:
+                soc_health_bonus = 50.0  # SOC在健康范围内给予奖励
+            arbitrage_bonus += soc_health_bonus
         
         # 电力成本/收入
         cost_grid = 0
@@ -217,9 +250,9 @@ class HydrogenEnv(gym.Env):
         if excess_h2 > 0: 
             penalty += excess_h2 * 10
 
-        # 总收益 (包含绿氢奖励)
-        step_reward = revenue_ev + revenue_fcev + revenue_grid + green_h2_bonus - cost_grid - penalty
-        step_profit = revenue_ev + revenue_fcev + revenue_grid + green_h2_bonus - cost_grid
+        # 总收益 (包含绿氢奖励 + 储能套利奖励)
+        step_reward = revenue_ev + revenue_fcev + revenue_grid + green_h2_bonus + arbitrage_bonus - cost_grid - penalty
+        step_profit = revenue_ev + revenue_fcev + revenue_grid + green_h2_bonus + arbitrage_bonus - cost_grid
 
         self.current_step += 1
         done = self.current_step >= Config.episode_length
@@ -277,6 +310,9 @@ class HydrogenEnv(gym.Env):
             "power_from_grid": power_from_grid,
             "green_h2_bonus": green_h2_bonus,
             "ele_power": ele_actual_power,
+            # 储能套利统计 (新增)
+            "arbitrage_bonus": arbitrage_bonus,
+            "price": price,
             # 兼容旧版
             "h2_sold": fcev_h2_demand * supply_ratio  # 近似值
         }
