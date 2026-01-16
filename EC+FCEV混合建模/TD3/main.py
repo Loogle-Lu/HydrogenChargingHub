@@ -1,50 +1,57 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from env import HydrogenEnv
-from sac import SAC, ReplayBuffer
+from td3 import TD3, ReplayBuffer
 from config import Config
 
 
 def plot_results(rewards, profits, soc_history, power_balance, green_h2_stats=None, arbitrage_stats=None):
+    # 设置中文显示和负号显示 (超大字体适配超大画布)
     plt.rcParams['axes.unicode_minus'] = False
+    plt.rcParams['font.size'] = 14  # 更大的全局字体
+    plt.rcParams['axes.titlesize'] = 16  # 更大的标题字体
+    plt.rcParams['axes.labelsize'] = 14  # 更大的轴标签字体
+    plt.rcParams['legend.fontsize'] = 13  # 更大的图例字体
+    plt.rcParams['xtick.labelsize'] = 12  # x轴刻度字体
+    plt.rcParams['ytick.labelsize'] = 12  # y轴刻度字体
 
-    # 根据有无绿氢和套利统计决定布局
+    # 根据有无绿氢和套利统计决定布局 (超大画布，便于查看细节)
     if green_h2_stats is not None and arbitrage_stats is not None:
-        fig, axs = plt.subplots(4, 2, figsize=(15, 20))  # 4行2列
+        fig, axs = plt.subplots(4, 2, figsize=(32, 40))  # 4行2列 (超大尺寸)
     elif green_h2_stats is not None or arbitrage_stats is not None:
-        fig, axs = plt.subplots(3, 2, figsize=(15, 15))  # 3行2列
+        fig, axs = plt.subplots(3, 2, figsize=(32, 30))  # 3行2列 (超大尺寸)
     else:
-        fig, axs = plt.subplots(2, 2, figsize=(15, 10))  # 2行2列
+        fig, axs = plt.subplots(2, 2, figsize=(32, 20))  # 2行2列 (超大尺寸)
 
     # 1. Training Reward
-    axs[0, 0].plot(rewards)
-    axs[0, 0].set_title("Training Reward Curve (w/ Green H2 Bonus)")
-    axs[0, 0].set_xlabel("Episode")
-    axs[0, 0].set_ylabel("Total Reward")
-    axs[0, 0].grid(True, alpha=0.3)
+    axs[0, 0].plot(rewards, linewidth=3.5, color='#1f77b4')
+    axs[0, 0].set_title("Training Reward Curve (w/ Green H2 Bonus)", fontsize=18, fontweight='bold')
+    axs[0, 0].set_xlabel("Episode", fontsize=15)
+    axs[0, 0].set_ylabel("Total Reward", fontsize=15)
+    axs[0, 0].grid(True, alpha=0.3, linestyle='--', linewidth=1.2)
 
     # 2. Reward Moving Average (减少视觉震荡)
     window_size = 10
     if len(rewards) >= window_size:
         moving_avg = np.convolve(rewards, np.ones(window_size)/window_size, mode='valid')
-        axs[0, 1].plot(range(window_size-1, len(rewards)), moving_avg, color='blue', linewidth=2, label='MA(10)')
-        axs[0, 1].plot(rewards, color='lightblue', alpha=0.3, label='Raw')
+        axs[0, 1].plot(range(window_size-1, len(rewards)), moving_avg, color='#2ca02c', linewidth=4, label='MA(10)')
+        axs[0, 1].plot(rewards, color='lightblue', alpha=0.4, linewidth=2, label='Raw')
     else:
-        axs[0, 1].plot(rewards, color='blue', linewidth=2)
-    axs[0, 1].set_title("Training Reward (Moving Average)")
-    axs[0, 1].set_xlabel("Episode")
-    axs[0, 1].set_ylabel("Reward")
-    axs[0, 1].legend()
-    axs[0, 1].grid(True, alpha=0.3)
+        axs[0, 1].plot(rewards, color='#2ca02c', linewidth=3.5)
+    axs[0, 1].set_title("Training Reward (Moving Average)", fontsize=18, fontweight='bold')
+    axs[0, 1].set_xlabel("Episode", fontsize=15)
+    axs[0, 1].set_ylabel("Reward", fontsize=15)
+    axs[0, 1].legend(fontsize=14, loc='best')
+    axs[0, 1].grid(True, alpha=0.3, linestyle='--', linewidth=1.2)
 
     # 3. SOC History
-    axs[1, 0].plot(soc_history, color='orange', label='SOC', linewidth=2)
-    axs[1, 0].axhline(y=Config.storage_initial, color='r', linestyle='--', label='Initial Target')
-    axs[1, 0].set_title("H2 Storage Level (Should Match Target)")
+    axs[1, 0].plot(soc_history, color='#ff7f0e', label='SOC', linewidth=3.5)
+    axs[1, 0].axhline(y=Config.storage_initial, color='#d62728', linestyle='--', linewidth=3, label='Initial Target')
+    axs[1, 0].set_title("H2 Storage Level (Should Match Target)", fontsize=18, fontweight='bold')
     axs[1, 0].set_ylim(0, 1.0)
-    axs[1, 0].set_ylabel("SOC")
-    axs[1, 0].legend()
-    axs[1, 0].grid(True, alpha=0.3)
+    axs[1, 0].set_ylabel("SOC", fontsize=15)
+    axs[1, 0].legend(fontsize=14, loc='best')
+    axs[1, 0].grid(True, alpha=0.3, linestyle='--', linewidth=1.2)
 
     # 4. Energy Balance
     steps = range(len(power_balance['re']))
@@ -53,19 +60,19 @@ def plot_results(rewards, profits, soc_history, power_balance, green_h2_stats=No
     fc_power = np.array(power_balance['fc'])
     load_power = np.array(power_balance['load'])
 
-    axs[1, 1].plot(steps, re_gen, label='RE Gen (+)', alpha=0.7, linewidth=1.5)
-    axs[1, 1].plot(steps, fc_power, label='Fuel Cell (+)', color='purple', linewidth=2)
-    axs[1, 1].plot(steps, -load_power, label='Total Load (-)', color='red', alpha=0.5)
+    axs[1, 1].plot(steps, re_gen, label='RE Gen (+)', alpha=0.8, linewidth=3, color='#2ca02c')
+    axs[1, 1].plot(steps, fc_power, label='Fuel Cell (+)', color='#9467bd', linewidth=3.5)
+    axs[1, 1].plot(steps, -load_power, label='Total Load (-)', color='#d62728', alpha=0.7, linewidth=3)
 
-    axs[1, 1].fill_between(steps, grid_power, 0, where=(grid_power < 0), color='gray', alpha=0.3,
+    axs[1, 1].fill_between(steps, grid_power, 0, where=(grid_power < 0), color='gray', alpha=0.4,
                            label='Grid Import (-)')
-    axs[1, 1].fill_between(steps, grid_power, 0, where=(grid_power > 0), color='green', alpha=0.3,
+    axs[1, 1].fill_between(steps, grid_power, 0, where=(grid_power > 0), color='#2ca02c', alpha=0.3,
                            label='Grid Export (+)')
 
-    axs[1, 1].set_title("Energy Balance")
-    axs[1, 1].set_ylabel("Power (kW)")
-    axs[1, 1].legend(loc='upper right', fontsize='small')
-    axs[1, 1].grid(True, alpha=0.3)
+    axs[1, 1].set_title("Energy Balance", fontsize=18, fontweight='bold')
+    axs[1, 1].set_ylabel("Power (kW)", fontsize=15)
+    axs[1, 1].legend(loc='upper right', fontsize=13)
+    axs[1, 1].grid(True, alpha=0.3, linestyle='--', linewidth=1.2)
 
     # 5. 绿氢生产统计 (如果启用了阈值策略)
     if green_h2_stats is not None:
@@ -178,7 +185,8 @@ def train():
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    agent = SAC(state_dim, action_dim)
+    # [v2.5] 使用TD3算法替代SAC
+    agent = TD3(state_dim, action_dim)
     replay_buffer = ReplayBuffer(capacity=100000, state_dim=state_dim, action_dim=action_dim)
 
     num_episodes = 200
@@ -191,14 +199,17 @@ def train():
     last_episode_green_h2 = {'green_ratio': [], 'threshold': [], 'power_from_re': [], 'power_from_grid': []}
     last_episode_arbitrage = {'arbitrage_bonus': [], 'price': [], 'ele_power': [], 'fc_power': []}
 
-    print("Start Training Hydrogen Project (SAC + Storage Arbitrage Strategy)...")
+    print("=" * 70)
+    print("Start Training Hydrogen Project (TD3 + Storage Arbitrage Strategy)")
+    print("=" * 70)
+    print(f"Algorithm: TD3 (Twin Delayed DDPG)")
     print(f"Green Hydrogen Strategy: {'Enabled' if Config.enable_threshold_strategy else 'Disabled'}")
     print(f"Storage Arbitrage: {'Enabled' if Config.enable_arbitrage_bonus else 'Disabled'}")
     print(f"Base Threshold: {Config.base_power_threshold} kW")
     print(f"Green H2 Bonus: ${Config.green_hydrogen_bonus}/kg")
     print(f"Arbitrage Coef: {Config.arbitrage_bonus_coef}")
     print(f"I2S Penalty Weight: {Config.i2s_penalty_weight}")
-    print("-" * 60)
+    print("-" * 70)
 
     for episode in range(num_episodes):
         state = env.reset()
@@ -251,8 +262,8 @@ def train():
         agent.step_schedulers()
         
         if (episode + 1) % 10 == 0:
-            current_alpha = agent.alpha
-            print(f"Episode {episode + 1}/{num_episodes}, Reward: {episode_reward:.2f}, Final SOC: {state[0]:.2f}, Alpha: {current_alpha:.4f}")
+            # TD3不需要显示alpha (无熵调优)
+            print(f"Episode {episode + 1}/{num_episodes}, Reward: {episode_reward:.2f}, Final SOC: {state[0]:.2f}, Updates: {agent.total_it}")
 
     # 打印绿氢生产统计
     if Config.enable_threshold_strategy:
