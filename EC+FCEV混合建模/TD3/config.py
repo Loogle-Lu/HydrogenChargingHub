@@ -231,3 +231,32 @@ class Config:
     penalty_unmet_h2_demand = 500.0  # $/kg 缺氢惩罚
     penalty_unmet_ev_demand = 150.0  # $/vehicle 无法服务EV惩罚
     penalty_vehicle_waiting = 30.0  # $/vehicle/hour 等待时间惩罚
+    
+    # 12. 电池储能系统 (Battery Energy Storage System, BESS) - v2.6新增
+    # 核心参数
+    battery_capacity = 500.0  # kWh (储能容量，约相当于8辆EV电池)
+    battery_max_charge_power = 250.0  # kW (最大充电功率，C-rate=0.5)
+    battery_max_discharge_power = 250.0  # kW (最大放电功率，C-rate=0.5)
+    
+    # 效率参数
+    battery_charge_efficiency = 0.95  # 充电效率 (典型锂电池)
+    battery_discharge_efficiency = 0.95  # 放电效率
+    # 往返效率 = 0.95 × 0.95 = 90.25% (远高于氢储能的30-40%)
+    
+    # SOC约束
+    battery_min_soc = 0.10  # 最小SOC (保护电池寿命)
+    battery_max_soc = 0.90  # 最大SOC (保护电池寿命)
+    battery_initial_soc = 0.50  # 初始SOC
+    
+    # 寿命参数
+    battery_lifetime_cycles = 5000  # 循环寿命 (80% DOD)
+    battery_degradation_cost = 0.05  # $/kWh (折旧成本)
+    
+    # 电池储能策略
+    enable_battery_storage = True  # 启用电池储能
+    battery_priority_threshold = 100.0  # kW (功率阈值，小于此值优先用电池)
+    
+    # 协同策略 (电池 vs 氢储能)
+    # - 电池: 短时调峰 (秒-分钟)，高效率，快响应
+    # - 氢气: 长时储能 (小时-天)，大容量，低效率
+    # - 协同: 电池削峰填谷，氢气季节调节

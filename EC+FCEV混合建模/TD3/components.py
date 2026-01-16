@@ -468,6 +468,169 @@ class FuelCell:
         return actual_power, consumed_h2
 
 
+class BatteryEnergyStorage:
+    """
+    电池储能系统 (Battery Energy Storage System, BESS)
+    
+    功能:
+    - 电化学储能，快速充放电
+    - 电网功率平滑和峰值管理
+    - 与氢储能协同工作
+    - 考虑充放电效率、SOC约束、功率限制
+    
+    优势相比氢储能:
+    - 响应速度快 (毫秒级 vs 分钟级)
+    - 往返效率高 (90-95% vs 30-40%)
+    - 适合短时调峰
+    
+    协同策略:
+    - 电池: 短时调峰、功率平滑 (秒-分钟)
+    - 氢气: 长时储能、季节调节 (小时-天)
+    """
+    
+    def __init__(self):
+        self.capacity = Config.battery_capacity  # kWh
+        self.max_charge_power = Config.battery_max_charge_power  # kW
+        self.max_discharge_power = Config.battery_max_discharge_power  # kW
+        self.charge_efficiency = Config.battery_charge_efficiency  # 充电效率
+        self.discharge_efficiency = Config.battery_discharge_efficiency  # 放电效率
+        self.min_soc = Config.battery_min_soc
+        self.max_soc = Config.battery_max_soc
+        self.initial_soc = Config.battery_initial_soc
+        
+        # 当前状态
+        self.current_energy = self.initial_soc * self.capacity  # kWh
+        self.total_charge_energy = 0.0  # 累计充电量 (kWh)
+        self.total_discharge_energy = 0.0  # 累计放电量 (kWh)
+        self.charge_cycles = 0.0  # 充放电循环次数
+        
+    def get_soc(self):
+        """获取当前SOC"""
+        return self.current_energy / self.capacity
+    
+    def get_available_charge_power(self):
+        """获取可用充电功率 (kW)"""
+        soc = self.get_soc()
+        if soc >= self.max_soc:
+            return 0.0
+        # 可充入的能量 (kWh)
+        available_energy = (self.max_soc - soc) * self.capacity
+        # 考虑充电效率，可接受的输入功率
+        available_power = available_energy / Config.dt / self.charge_efficiency
+        return min(available_power, self.max_charge_power)
+    
+    def get_available_discharge_power(self):
+        """获取可用放电功率 (kW)"""
+        soc = self.get_soc()
+        if soc <= self.min_soc:
+            return 0.0
+        # 可放出的能量 (kWh)
+        available_energy = (soc - self.min_soc) * self.capacity
+        # 考虑放电效率，可输出的功率
+        available_power = available_energy / Config.dt * self.discharge_efficiency
+        return min(available_power, self.max_discharge_power)
+    
+    def charge(self, power_input, dt=None):
+        """
+        充电
+        
+        参数:
+            power_input: 输入功率 (kW)
+            dt: 时间步长 (h)
+        
+        返回:
+            actual_power: 实际充电功率 (kW)
+            energy_stored: 实际存储的能量 (kWh)
+        """
+        if dt is None:
+            dt = Config.dt
+        
+        # 限制充电功率
+        available_power = self.get_available_charge_power()
+        actual_power = min(power_input, available_power)
+        
+        if actual_power <= 0:
+            return 0.0, 0.0
+        
+        # 考虑充电效率
+        energy_input = actual_power * dt
+        energy_stored = energy_input * self.charge_efficiency
+        
+        # 更新SOC
+        self.current_energy = min(
+            self.current_energy + energy_stored,
+            self.max_soc * self.capacity
+        )
+        
+        # 统计
+        self.total_charge_energy += energy_input
+        
+        return actual_power, energy_stored
+    
+    def discharge(self, power_demand, dt=None):
+        """
+        放电
+        
+        参数:
+            power_demand: 需求功率 (kW)
+            dt: 时间步长 (h)
+        
+        返回:
+            actual_power: 实际放电功率 (kW)
+            energy_consumed: 实际消耗的储存能量 (kWh)
+        """
+        if dt is None:
+            dt = Config.dt
+        
+        # 限制放电功率
+        available_power = self.get_available_discharge_power()
+        actual_power = min(power_demand, available_power)
+        
+        if actual_power <= 0:
+            return 0.0, 0.0
+        
+        # 考虑放电效率
+        energy_output = actual_power * dt
+        energy_consumed = energy_output / self.discharge_efficiency
+        
+        # 更新SOC
+        self.current_energy = max(
+            self.current_energy - energy_consumed,
+            self.min_soc * self.capacity
+        )
+        
+        # 统计
+        self.total_discharge_energy += energy_output
+        
+        # 更新循环次数 (简化：每放电一次电池容量算0.5个循环)
+        self.charge_cycles += energy_consumed / self.capacity / 2
+        
+        return actual_power, energy_consumed
+    
+    def get_statistics(self):
+        """获取电池统计信息"""
+        total_throughput = self.total_charge_energy + self.total_discharge_energy
+        roundtrip_efficiency = (self.total_discharge_energy / self.total_charge_energy * 100) if self.total_charge_energy > 0 else 0.0
+        
+        return {
+            'current_soc': self.get_soc(),
+            'current_energy_kwh': self.current_energy,
+            'total_charge_kwh': self.total_charge_energy,
+            'total_discharge_kwh': self.total_discharge_energy,
+            'total_throughput_kwh': total_throughput,
+            'roundtrip_efficiency_pct': roundtrip_efficiency,
+            'charge_cycles': self.charge_cycles,
+            'degradation_pct': min(self.charge_cycles / Config.battery_lifetime_cycles * 100, 100)
+        }
+    
+    def reset(self):
+        """重置电池状态"""
+        self.current_energy = self.initial_soc * self.capacity
+        self.total_charge_energy = 0.0
+        self.total_discharge_energy = 0.0
+        self.charge_cycles = 0.0
+
+
 # ==================== EV/FCEV 需求建模 ====================
 
 class Vehicle:

@@ -4,7 +4,7 @@ from gym import spaces
 from config import Config
 from components import (
     Electrolyzer, MultiStageCompressorSystem, MultiTankStorage, FuelCell, NonlinearChiller,
-    MixedDemandGenerator, IntegratedServiceStation
+    BatteryEnergyStorage, MixedDemandGenerator, IntegratedServiceStation
 )
 from data_loader import DataLoader
 
@@ -18,6 +18,7 @@ class HydrogenEnv(gym.Env):
         self.chiller = NonlinearChiller()
         self.storage = MultiTankStorage()
         self.fc = FuelCell()
+        self.battery = BatteryEnergyStorage()  # v2.6新增: 电池储能系统
         self.data_loader = DataLoader()
         
         # 新增: EV/FCEV需求建模
@@ -30,8 +31,8 @@ class HydrogenEnv(gym.Env):
         self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
         
         # 观察空间扩展: 
-        # [总SOC, T1_SOC, T2_SOC, 电价, 可再生能源, EV队列长度, FCEV队列长度, 时段]
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32)
+        # [总SOC, T1_SOC, T2_SOC, 电池SOC, 电价, 可再生能源, EV队列长度, FCEV队列长度, 时段]
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)
         self.state = None
         self.current_data = None
 
@@ -40,6 +41,7 @@ class HydrogenEnv(gym.Env):
         self.data_loader.reset()
         self.storage = MultiTankStorage()  # 重置到初始 SOC
         self.chiller.reset()  # 重置冷却机状态
+        self.battery.reset()  # v2.6: 重置电池状态
         self.service_station = IntegratedServiceStation()  # 重置服务站
         self.demand_generator = MixedDemandGenerator()  # 重置需求生成器
         self.ele.reset()  # 重置电解槽统计
@@ -51,9 +53,10 @@ class HydrogenEnv(gym.Env):
         hour_of_day = int((self.current_step * Config.dt) % 24)
         
         self.state = np.array([
-            total_soc,  # 总体SOC
+            total_soc,  # 总体氢气SOC
             self.storage.t1.get_soc(),  # T1 SOC
             self.storage.t2.get_soc(),  # T2 SOC
+            self.battery.get_soc(),  # 电池SOC (v2.6新增)
             self.current_data["price"],  # 电价
             re_power,  # 可再生能源
             0.0,  # EV队列长度 (初始为0)
@@ -198,11 +201,33 @@ class HydrogenEnv(gym.Env):
         real_fc_h2_used = h2_needed_for_fc * supply_ratio
         fc_actual_power, _ = self.fc.compute(real_fc_h2_used)
 
-        # --- 11. 电网互动与财务 (含绿氢奖励 + 储能套利奖励) ---
+        # --- 11. 电池储能系统 (v2.6新增: 快速调峰与功率平滑) ---
+        battery_charge_power = 0.0
+        battery_discharge_power = 0.0
+        battery_net_power = 0.0  # 电池净输出功率 (放电为正，充电为负)
+        
+        if Config.enable_battery_storage:
+            # 初步计算电力缺口 (不含电池)
+            available_re_for_grid = re_gen - power_from_re
+            preliminary_net = (fc_actual_power + available_re_for_grid) - (total_load - ele_actual_power)
+            
+            # 电池充放电策略:
+            # 1. 当有功率剩余 (preliminary_net > 0): 充电存储
+            # 2. 当有功率缺口 (preliminary_net < 0): 放电补充
+            # 3. 优先级: 电池 > 电网 (电池响应快，效率高)
+            
+            if preliminary_net > 50:  # 有剩余功率，充电
+                battery_charge_power, _ = self.battery.charge(preliminary_net)
+                battery_net_power = -battery_charge_power  # 充电为负
+            elif preliminary_net < -50:  # 功率缺口，放电
+                battery_discharge_power, _ = self.battery.discharge(-preliminary_net)
+                battery_net_power = battery_discharge_power  # 放电为正
+        
+        # --- 12. 电网互动与财务 (含绿氢奖励 + 储能套利奖励 + 电池) ---
         # 电力平衡: 供应 - 需求
         # 注意: 电解槽消耗的RE已经在power_from_re中体现，不重复计算
         available_re_for_grid = re_gen - power_from_re  # 剩余可再生能源
-        net_power = (fc_actual_power + available_re_for_grid) - (total_load - ele_actual_power)
+        net_power = (fc_actual_power + available_re_for_grid + battery_net_power) - (total_load - ele_actual_power)
 
         # 收入来源
         revenue_ev = ev_revenue  # EV充电收入
@@ -275,6 +300,7 @@ class HydrogenEnv(gym.Env):
             self.storage.get_total_soc(),
             self.storage.t1.get_soc(),
             self.storage.t2.get_soc(),
+            self.battery.get_soc(),  # v2.6: 电池SOC
             self.current_data["price"],
             next_re,
             min(station_stats['ev_queue_length'] / 10.0, 1.0),  # 归一化EV队列
@@ -310,9 +336,14 @@ class HydrogenEnv(gym.Env):
             "power_from_grid": power_from_grid,
             "green_h2_bonus": green_h2_bonus,
             "ele_power": ele_actual_power,
-            # 储能套利统计 (新增)
+            # 储能套利统计
             "arbitrage_bonus": arbitrage_bonus,
             "price": price,
+            # 电池储能统计 (v2.6新增)
+            "battery_soc": self.battery.get_soc(),
+            "battery_charge_power": battery_charge_power,
+            "battery_discharge_power": battery_discharge_power,
+            "battery_net_power": battery_net_power,
             # 兼容旧版
             "h2_sold": fcev_h2_demand * supply_ratio  # 近似值
         }
