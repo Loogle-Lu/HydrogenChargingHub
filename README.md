@@ -2,7 +2,7 @@
 
 ## 系统架构图
 
-![System Architecture](../../system_architecture_diagram.png)
+![System Architecture](system_architecture_diagram.png)
 
 **系统组成说明**：
 - **能源输入层**: 可再生能源(PV+Wind) + 电网 → 电力母线
