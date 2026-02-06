@@ -24,17 +24,40 @@
 - **EV充电**: 快充/慢充/超快充，支持需求响应  
 - **FCEV加氢**: 基于SAE J2601协议，3-5分钟快速充装  
 - **氢气生产**: 电解槽 + 多级压缩机(C1/C2/C3) + 级联储罐  
-- **可变功率阈值策略**: 智能优化绿氢生产，最大化可再生能源利用  
 - **储能套利策略**: 低价购电制氢，高价放电卖电，智能能量管理  
 - **级联压缩机优化**: VSD变速驱动 + 智能旁路 + 动态冷却 + 自适应压力 (v3.1论文创新点)
-- **非线性Chiller**: 考虑PLR和温度的真实性能曲线  
+- **线性Chiller**: 固定COP线性冷却模型 (v3.2简化)  
 - **智能调度**: PPO强化学习Agent优化决策 (on-policy，样本高效)  
-- **多收入源**: EV充电 + FCEV加氢 + 电网售电 + 绿氢奖励 + 储能套利  
+- **多收入源**: EV充电 + FCEV加氢 + 电网售电 + 储能套利  
 - **双储能系统**: 电池BESS (快速调峰) + 氢储能 (长时储能)
 
 ---
 
 ## 更新日志
+
+**v3.2 (2026-02-06) - 模型简化与清理**
+
+- **移除可变功率阈值策略 (Variable Power Threshold Strategy)**
+  - 删除 `_compute_dynamic_threshold()` 动态阈值计算方法
+  - 删除 `enable_threshold_strategy`、`base_power_threshold`、`threshold_price_coef`、`threshold_soc_coef`、`green_hydrogen_bonus`、`min_power_threshold`、`max_power_threshold` 等配置参数
+  - 简化 Electrolyzer 类: 移除阈值逻辑和绿氢追踪累积器，仅保留基本RE/Grid功率分配（优先使用可再生能源）
+  - 从奖励函数中移除 `green_h2_bonus` 绿氢奖励项
+  - 清理 env.py、main.py 中所有阈值策略相关的条件判断和统计输出
+
+- **冷却机组线性化 (NonlinearChiller → LinearChiller)**
+  - 将非线性冷却机组模型替换为线性模型: `Power = HeatLoad / COP`（固定COP）
+  - 移除部分负荷率(PLR)三次多项式性能曲线 (`chiller_cop_plr_coef`)
+  - 移除环境温度COP修正 (`chiller_temp_coef`、`ambient_temp_nominal`)
+  - 移除启停能耗惩罚 (`chiller_startup_energy`、`chiller_min_runtime`、`chiller_min_plr`)
+  - 保留额定冷却能力 (500 kW) 和固定COP (3.5)
+
+- **影响分析**
+  - 奖励函数: `Reward = EV收入 + FCEV收入 + 电网售电 + 储能套利 - 电网成本 - 惩罚`（移除绿氢奖励项）
+  - 电解槽: 仍然优先使用可再生能源，但不再有动态阈值机制和绿氢奖励
+  - Chiller: 功耗计算简化为固定COP线性关系，移除PLR/温度非线性效应和启停惩罚
+  - 观察空间和动作空间不变 (9维/2维)
+
+---
 
 **v3.1 (2026-02-01) - 级联压缩机系统高级优化 [论文核心创新点]**
 
@@ -236,7 +259,7 @@
 │ • EV充电 (直接)                     │
 │ • 电解槽制氢                        │
 │ • 压缩机C1/C2/C3 (v3.1智能优化)   │
-│ • Chiller冷却                       │
+│ • Chiller线性冷却                    │
 │ • 燃料电池发电                       │
 └────────────────────────────────────┘
     ↓ 氢气
@@ -510,7 +533,6 @@ python main.py
 
 训练完成后将显示:
 - 训练奖励曲线
-- 绿氢生产统计
 - 储能套利统计
 - 电池BESS统计
 - **压缩机系统统计** (v3.1新增)
@@ -592,7 +614,6 @@ Reward = (
     + EV充电收入 ($0.35/kWh)
     + FCEV加氢收入 ($12/kg)
     + 电网售电收入
-    + 绿氢奖励 ($5/kg)
     + 储能套利奖励
     - 电网购电成本
     - 压缩机能耗成本 (v3.1优化降低)
@@ -613,8 +634,8 @@ v3.1影响:
 PPO/
 ├── PPO.py              # PPO算法 (Actor-Critic + GAE)
 ├── env.py              # 氢电集成环境
-├── components.py       # 物理组件 (v3.1压缩机优化)
-├── config.py           # 配置参数 (v3.1新增VSD/旁路等参数)
+├── components.py       # 物理组件 (v3.1压缩机优化, v3.2线性Chiller)
+├── config.py           # 配置参数 (v3.2简化: 移除阈值策略, 线性Chiller)
 ├── data_loader.py      # 真实数据加载
 ├── main.py             # 训练主程序 (v3.1压缩机统计)
 └── README.md           # 本文档
@@ -684,19 +705,13 @@ TOTAL Compressor Savings: 1616.60 kWh (23.0%)
 
 综合效果: 节能45-95%，平均60%
 
-### 2. 可变功率阈值策略
-
-动态阈值 = Base + f(Price) + f(SOC) + f(RE)
-
-绿氢奖励: $5/kg
-
-### 3. 储能套利策略
+### 2. 储能套利策略
 
 低价制氢 + 高价放电
 
 套利奖励: 基于价差动态计算
 
-### 4. 双储能系统
+### 3. 双储能系统
 
 电池BESS (短时) + 氢储能 (长时)
 
@@ -824,9 +839,8 @@ TOTAL Compressor Savings: 1616.60 kWh (23.0%)
 1. PPO算法应用 - 工业标准RL
 2. **级联压缩机智能优化** - 论文核心创新
 3. 双储能系统 - 电池+氢气协同
-4. 可变功率阈值 - 绿氢生产最大化
-5. 储能套利策略 - 低买高卖
-6. 真实需求建模 - EV/FCEV混合
+4. 储能套利策略 - 低买高卖
+5. 真实需求建模 - EV/FCEV混合
 
 ### 工程价值
 
@@ -849,6 +863,6 @@ TOTAL Compressor Savings: 1616.60 kWh (23.0%)
 
 ---
 
-**最后更新**: 2026-02-01  
-**当前版本**: v3.1 (Cascade Compressor Optimization)  
+**最后更新**: 2026-02-06  
+**当前版本**: v3.2 (Model Simplification)  
 **作者**: Loogle

@@ -27,26 +27,6 @@ class Config:
     ele_max_power = 1000.0  # kW
     ele_efficiency = 50.0  # kWh/kg
     
-    # 1.1 可变功率阈值策略 (Variable Power Threshold Strategy)
-    # 目标: 最大化绿氢生产，优先利用可再生能源
-    enable_threshold_strategy = True
-    
-    # 动态阈值参数
-    # 当 RE_available > threshold 时，生产绿氢
-    # 当 RE_available < threshold 时，可使用电网能源
-    base_power_threshold = 100.0  # kW (降低基准阈值，更容易触发制氢)
-    
-    # 阈值调整系数 (基于电价和储氢量动态调整)
-    threshold_price_coef = 300.0  # 降低电价敏感度
-    threshold_soc_coef = 300.0  # 提高SOC敏感度，低SOC时更积极制氢
-    
-    # 绿氢优先级权重 (奖励使用可再生能源制氢)
-    green_hydrogen_bonus = 5.0  # $/kg (提高绿氢奖励，增强激励)
-    
-    # 阈值范围限制
-    min_power_threshold = 50.0  # kW (降低最小阈值)
-    max_power_threshold = 600.0  # kW (降低最大阈值)
-
     # 2. 多级级联压缩机系统 (Multi-Stage Cascade Compressor System)
     # 公共压缩机参数
     comp_efficiency = 0.75  # 额定效率（50%负载）
@@ -137,28 +117,12 @@ class Config:
     fc_max_power = 500.0
     fc_efficiency = 16.0  # kWh/kg
 
-    # 5. 冷却机 (Chiller - 复杂非线性模型)
-    # 基础参数
+    # 5. 冷却机 (Chiller - 线性模型)
     chiller_rated_capacity = 500.0  # kW (额定冷却能力)
-    chiller_rated_cop = 3.5  # 额定工况COP
-    chiller_min_plr = 0.1  # 最小部分负荷率 (Part Load Ratio)
-    
-    # 非线性性能曲线参数 (基于实际工业冷水机组性能)
-    # COP = f(PLR, T_ambient) 的多项式系数
-    # COP(PLR) = a0 + a1*PLR + a2*PLR^2 + a3*PLR^3
-    chiller_cop_plr_coef = [0.5, 0.8, 0.7, -1.0]  # 部分负荷性能曲线
-    
-    # 温度修正系数 (环境温度影响)
-    chiller_temp_coef = [1.2, -0.008, 0.00002]  # COP_temp = b0 + b1*T + b2*T^2
-    
-    # 启停能耗惩罚
-    chiller_startup_energy = 10.0  # kWh (每次启动能耗)
-    chiller_min_runtime = 0.5  # hours (最小运行时间)
+    chiller_rated_cop = 3.5  # 固定COP
     
     # 热力学参数
-    gas_heat_capacity = 14.3  # kJ/(kg*K)
     target_temp = 298.15  # K (冷却目标温度)
-    ambient_temp_nominal = 298.15  # K (名义环境温度)
 
     # 6. FCEV加氢需求参数 (基于SAE J2601协议)
     # Hyundai Nexo规格 (参考图片)

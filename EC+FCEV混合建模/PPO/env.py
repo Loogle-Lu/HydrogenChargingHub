@@ -3,7 +3,7 @@ import numpy as np
 from gym import spaces
 from config import Config
 from components import (
-    Electrolyzer, MultiStageCompressorSystem, MultiTankStorage, FuelCell, NonlinearChiller,
+    Electrolyzer, MultiStageCompressorSystem, MultiTankStorage, FuelCell, LinearChiller,
     BatteryEnergyStorage, MixedDemandGenerator, IntegratedServiceStation
 )
 from data_loader import DataLoader
@@ -15,7 +15,7 @@ class HydrogenEnv(gym.Env):
         # 初始化组件
         self.ele = Electrolyzer()
         self.comp_system = MultiStageCompressorSystem()
-        self.chiller = NonlinearChiller()
+        self.chiller = LinearChiller()
         self.storage = MultiTankStorage()
         self.fc = FuelCell()
         self.battery = BatteryEnergyStorage()  # v2.6新增: 电池储能系统
@@ -66,58 +66,6 @@ class HydrogenEnv(gym.Env):
         ], dtype=np.float32)
         return self.state
     
-    def _compute_dynamic_threshold(self, price, soc, re_power):
-        """
-        计算动态功率阈值
-        
-        阈值策略:
-        1. 电价低时，降低阈值 (鼓励低价时制氢储能)
-        2. 储氢量低时，大幅降低阈值 (加快制氢补充储氢)
-        3. RE功率高时，大幅降低阈值 (充分利用RE)
-        
-        返回: 动态阈值 (kW)
-        """
-        if not Config.enable_threshold_strategy:
-            return 0.0
-        
-        # 基准阈值
-        threshold = Config.base_power_threshold
-        
-        # 电价调整 (电价越低，阈值越低，鼓励低价制氢)
-        # 低价时（<0.06）降低阈值，高价时（>0.10）提高阈值
-        if price < Config.price_threshold_low:
-            # 低电价，大幅降低阈值，鼓励制氢
-            price_adjustment = -(Config.price_threshold_low - price) * Config.threshold_price_coef * 2
-        elif price > Config.price_threshold_high:
-            # 高电价，提高阈值，减少制氢
-            price_adjustment = (price - Config.price_threshold_high) * Config.threshold_price_coef
-        else:
-            # 中等电价，小幅调整
-            price_adjustment = (price - 0.08) * Config.threshold_price_coef * 0.5
-        
-        # SOC调整 (SOC越低，阈值越低，加快制氢)
-        # 当SOC < 0.4时，大幅降低阈值
-        if soc < 0.4:
-            soc_adjustment = -(0.5 - soc) * Config.threshold_soc_coef * 2
-        else:
-            soc_adjustment = -(0.5 - soc) * Config.threshold_soc_coef
-        
-        # RE可用性调整 (RE越充足，阈值越低)
-        re_ratio = min(re_power / Config.ele_max_power, 1.0)
-        re_adjustment = -re_ratio * 100.0  # RE充足时大幅降低阈值
-        
-        # 综合调整
-        dynamic_threshold = threshold + price_adjustment + soc_adjustment + re_adjustment
-        
-        # 限制在合理范围
-        dynamic_threshold = np.clip(
-            dynamic_threshold,
-            Config.min_power_threshold,
-            Config.max_power_threshold
-        )
-        
-        return dynamic_threshold
-
     def step(self, action):
         ele_ratio = np.clip(action[0], 0, 1)
         fc_ratio = np.clip(action[1], 0, 1)
@@ -130,14 +78,11 @@ class HydrogenEnv(gym.Env):
         ev_arrivals, fcev_arrivals = self.demand_generator.generate_vehicles(self.current_step)
         self.service_station.add_vehicles(ev_arrivals, fcev_arrivals)
 
-        # --- 2. 计算动态功率阈值 ---
+        # --- 2. 制氢 (Electrolyzer -> T1) ---
         current_soc = self.storage.get_total_soc()
-        power_threshold = self._compute_dynamic_threshold(price, current_soc, re_gen)
-
-        # --- 3. 制氢 (Electrolyzer -> T1) - 应用阈值策略 ---
         ele_power_target = ele_ratio * Config.ele_max_power
         h2_produced, ele_actual_power, green_h2_ratio, power_from_re, power_from_grid = \
-            self.ele.compute(ele_power_target, re_gen, power_threshold)
+            self.ele.compute(ele_power_target, re_gen)
         
         # --- 4. 计算可用氢气 (用于FCEV加氢) ---
         # 从T3系统获取可用氢气量
@@ -187,7 +132,7 @@ class HydrogenEnv(gym.Env):
         
         total_comp_heat = c1_heat + c2_heat + c3_heat
         
-        # --- 7. 非线性Chiller ---
+        # --- 7. 线性Chiller ---
         chiller_power = self.chiller.compute_power(total_comp_heat)
         
         # --- 8. 总电力负荷 ---
@@ -245,7 +190,7 @@ class HydrogenEnv(gym.Env):
                 battery_discharge_power, _ = self.battery.discharge(-preliminary_net)
                 battery_net_power = battery_discharge_power  # 放电为正
         
-        # --- 12. 电网互动与财务 (含绿氢奖励 + 储能套利奖励 + 电池) ---
+        # --- 12. 电网互动与财务 (含储能套利奖励 + 电池) ---
         # 电力平衡: 供应 - 需求
         # 注意: 电解槽消耗的RE已经在power_from_re中体现，不重复计算
         available_re_for_grid = re_gen - power_from_re  # 剩余可再生能源
@@ -254,12 +199,6 @@ class HydrogenEnv(gym.Env):
         # 收入来源
         revenue_ev = ev_revenue  # EV充电收入
         revenue_fcev = fcev_revenue  # FCEV加氢收入
-        
-        # 绿氢奖励 (鼓励使用可再生能源制氢)
-        green_h2_bonus = 0.0
-        if Config.enable_threshold_strategy:
-            green_h2_produced_this_step = (power_from_re / Config.ele_efficiency) * Config.dt
-            green_h2_bonus = green_h2_produced_this_step * Config.green_hydrogen_bonus
         
         # 储能套利奖励 (新增: 鼓励低价制氢、高价放电)
         arbitrage_bonus = 0.0
@@ -321,9 +260,9 @@ class HydrogenEnv(gym.Env):
         if excess_h2 > 0: 
             penalty += excess_h2 * 10
 
-        # 总收益 (包含绿氢奖励 + 储能套利奖励)
-        step_reward = revenue_ev + revenue_fcev + revenue_grid + green_h2_bonus + arbitrage_bonus - cost_grid - penalty
-        step_profit = revenue_ev + revenue_fcev + revenue_grid + green_h2_bonus + arbitrage_bonus - cost_grid
+        # 总收益 (包含储能套利奖励)
+        step_reward = revenue_ev + revenue_fcev + revenue_grid + arbitrage_bonus - cost_grid - penalty
+        step_profit = revenue_ev + revenue_fcev + revenue_grid + arbitrage_bonus - cost_grid
 
         self.current_step += 1
         done = self.current_step >= Config.episode_length
@@ -378,12 +317,10 @@ class HydrogenEnv(gym.Env):
             "ev_queue": station_stats['ev_queue_length'],
             "fcev_queue": station_stats['fcev_queue_length'],
             "vehicles_delayed": station_stats['vehicles_delayed'],
-            # 绿氢策略统计
-            "power_threshold": power_threshold,
+            # 绿氢统计
             "green_h2_ratio": green_h2_ratio,
             "power_from_re": power_from_re,
             "power_from_grid": power_from_grid,
-            "green_h2_bonus": green_h2_bonus,
             "ele_power": ele_actual_power,
             # 储能套利统计
             "arbitrage_bonus": arbitrage_bonus,

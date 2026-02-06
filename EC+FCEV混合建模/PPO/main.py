@@ -258,7 +258,7 @@ def train():
     last_episode_profits = []
     last_episode_soc = []
     last_episode_power = {'re': [], 'net': [], 'fc': [], 'load': []}
-    last_episode_green_h2 = {'green_ratio': [], 'threshold': [], 'power_from_re': [], 'power_from_grid': []}
+    last_episode_green_h2 = {'green_ratio': [], 'power_from_re': [], 'power_from_grid': []}
     last_episode_arbitrage = {'arbitrage_bonus': [], 'price': [], 'ele_power': [], 'fc_power': []}
     last_episode_battery = {'soc': [], 'charge_power': [], 'discharge_power': []}  # v2.6新增
     last_episode_compressor = {'c1_power': [], 'c2_power': [], 'c3_power': [], 
@@ -271,11 +271,8 @@ def train():
     print("=" * 70)
     print(f"Algorithm: PPO (Proximal Policy Optimization)")
     print(f"Battery Storage: {'Enabled' if Config.enable_battery_storage else 'Disabled'} (v2.6)")
-    print(f"Green Hydrogen Strategy: {'Enabled' if Config.enable_threshold_strategy else 'Disabled'}")
     print(f"Storage Arbitrage: {'Enabled' if Config.enable_arbitrage_bonus else 'Disabled'}")
     print(f"Battery Capacity: {Config.battery_capacity} kWh")
-    print(f"Base Threshold: {Config.base_power_threshold} kW")
-    print(f"Green H2 Bonus: ${Config.green_hydrogen_bonus}/kg")
     print(f"Arbitrage Coef: {Config.arbitrage_bonus_coef}")
     print(f"I2S Penalty Weight: {Config.i2s_penalty_weight}")
     print("-" * 70)
@@ -289,7 +286,7 @@ def train():
             last_episode_profits = []
             last_episode_soc = [state[0]]
             last_episode_power = {'re': [], 'net': [], 'fc': [], 'load': []}
-            last_episode_green_h2 = {'green_ratio': [], 'threshold': [], 'power_from_re': [], 'power_from_grid': []}
+            last_episode_green_h2 = {'green_ratio': [], 'power_from_re': [], 'power_from_grid': []}
             last_episode_arbitrage = {'arbitrage_bonus': [], 'price': [], 'ele_power': [], 'fc_power': []}
             last_episode_battery = {'soc': [], 'charge_power': [], 'discharge_power': []}  # v2.6: 电池统计
 
@@ -313,11 +310,9 @@ def train():
                 last_episode_power['load'].append(info['load_power'])
                 
                 # 收集绿氢统计
-                if Config.enable_threshold_strategy:
-                    last_episode_green_h2['green_ratio'].append(info['green_h2_ratio'])
-                    last_episode_green_h2['threshold'].append(info['power_threshold'])
-                    last_episode_green_h2['power_from_re'].append(info['power_from_re'])
-                    last_episode_green_h2['power_from_grid'].append(info['power_from_grid'])
+                last_episode_green_h2['green_ratio'].append(info['green_h2_ratio'])
+                last_episode_green_h2['power_from_re'].append(info['power_from_re'])
+                last_episode_green_h2['power_from_grid'].append(info['power_from_grid'])
                 
                 # 收集储能套利统计
                 if Config.enable_arbitrage_bonus:
@@ -362,23 +357,7 @@ def train():
             print(f"Episode {episode + 1}/{num_episodes}, Reward: {episode_reward:.2f}, "
                   f"Final SOC: {state[0]:.2f}, Updates: {agent.total_updates}")
 
-    # 打印绿氢生产统计
-    if Config.enable_threshold_strategy:
-        ele_stats = env.ele.get_statistics()
-        print("\n" + "=" * 60)
-        print("GREEN HYDROGEN PRODUCTION STATISTICS (Training Summary)")
-        print("=" * 60)
-        print(f"Total Green H2 Produced:  {ele_stats['total_green_h2_kg']:.2f} kg")
-        print(f"Total Grid H2 Produced:   {ele_stats['total_grid_h2_kg']:.2f} kg")
-        print(f"Total H2 Produced:        {ele_stats['total_h2_kg']:.2f} kg")
-        print(f"Green H2 Percentage:      {ele_stats['green_h2_percentage']:.1f}%")
-        print(f"Total Green Energy Used:  {ele_stats['total_green_energy_kwh']:.2f} kWh")
-        print(f"Total Grid Energy Used:   {ele_stats['total_grid_energy_kwh']:.2f} kWh")
-        print("=" * 60 + "\n")
-        
-        green_h2_stats = last_episode_green_h2 if len(last_episode_green_h2['green_ratio']) > 0 else None
-    else:
-        green_h2_stats = None
+    green_h2_stats = last_episode_green_h2 if len(last_episode_green_h2['green_ratio']) > 0 else None
     
     # 打印储能套利统计
     if Config.enable_arbitrage_bonus:

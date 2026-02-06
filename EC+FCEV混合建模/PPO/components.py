@@ -5,27 +5,20 @@ from config import Config
 class Electrolyzer:
     """
     线性电解槽: 输入功率 -> 产氢量
-    支持可变功率阈值策略，区分绿氢和灰氢生产
+    优先使用可再生能源，剩余部分使用电网
     """
 
     def __init__(self):
         self.max_power = Config.ele_max_power
         self.efficiency = Config.ele_efficiency
-        
-        # 绿氢生产统计
-        self.total_green_h2 = 0.0  # kg
-        self.total_grid_h2 = 0.0   # kg
-        self.total_green_energy = 0.0  # kWh
-        self.total_grid_energy = 0.0   # kWh
 
-    def compute(self, power_input, re_available=0.0, power_threshold=None):
+    def compute(self, power_input, re_available=0.0):
         """
-        计算产氢量，并区分绿氢和灰氢
+        计算产氢量
         
         参数:
         - power_input: 目标输入功率 (kW)
         - re_available: 可用可再生能源功率 (kW)
-        - power_threshold: 功率阈值 (kW)，超过此值优先使用RE
         
         返回:
         - h2_flow_kg: 产氢量 (kg/h)
@@ -34,61 +27,19 @@ class Electrolyzer:
         - power_from_re: 来自可再生能源的功率 (kW)
         - power_from_grid: 来自电网的功率 (kW)
         """
-        # 限制在最大功率范围内
         power = np.clip(power_input, 0, self.max_power)
+        h2_flow_kg = power / self.efficiency
         
-        if not Config.enable_threshold_strategy or power_threshold is None:
-            # 不启用阈值策略，正常运行
-            h2_flow_kg = power / self.efficiency
-            return h2_flow_kg, power, 0.0, 0.0, power
-        
-        # 应用阈值策略
-        if re_available >= power_threshold:
-            # 可再生能源充足，优先使用RE生产绿氢
-            power_from_re = min(power, re_available)
-            power_from_grid = max(0, power - power_from_re)
-        else:
-            # 可再生能源不足阈值，可以使用电网能源
-            # 但仍优先使用可用的RE
-            power_from_re = min(power, re_available)
-            power_from_grid = power - power_from_re
-        
-        # 计算绿氢和灰氢产量
-        green_h2_flow = power_from_re / self.efficiency  # kg/h
-        grid_h2_flow = power_from_grid / self.efficiency  # kg/h
-        total_h2_flow = green_h2_flow + grid_h2_flow
-        
-        # 计算绿氢占比
+        # 优先使用可再生能源
+        power_from_re = min(power, re_available)
+        power_from_grid = power - power_from_re
         green_h2_ratio = power_from_re / power if power > 0 else 0.0
         
-        # 累积统计 (假设dt=Config.dt)
-        self.total_green_h2 += green_h2_flow * Config.dt
-        self.total_grid_h2 += grid_h2_flow * Config.dt
-        self.total_green_energy += power_from_re * Config.dt
-        self.total_grid_energy += power_from_grid * Config.dt
-        
-        return total_h2_flow, power, green_h2_ratio, power_from_re, power_from_grid
-    
-    def get_statistics(self):
-        """获取绿氢生产统计"""
-        total_h2 = self.total_green_h2 + self.total_grid_h2
-        green_h2_percentage = (self.total_green_h2 / total_h2 * 100) if total_h2 > 0 else 0.0
-        
-        return {
-            'total_green_h2_kg': self.total_green_h2,
-            'total_grid_h2_kg': self.total_grid_h2,
-            'total_h2_kg': total_h2,
-            'green_h2_percentage': green_h2_percentage,
-            'total_green_energy_kwh': self.total_green_energy,
-            'total_grid_energy_kwh': self.total_grid_energy
-        }
+        return h2_flow_kg, power, green_h2_ratio, power_from_re, power_from_grid
     
     def reset(self):
-        """重置统计数据"""
-        self.total_green_h2 = 0.0
-        self.total_grid_h2 = 0.0
-        self.total_green_energy = 0.0
-        self.total_grid_energy = 0.0
+        """重置状态"""
+        pass
 
 
 class Compressor:
@@ -450,109 +401,36 @@ class MultiStageCompressorSystem:
         self.energy_saved_by_bypass = 0.0
 
 
-class NonlinearChiller:
+class LinearChiller:
     """
-    复杂非线性冷却机模型
-    考虑:
-    1. 部分负荷率(PLR)对COP的非线性影响
-    2. 环境温度对性能的影响
-    3. 最小负荷限制和启停惩罚
-    4. 真实的性能曲线
+    线性冷却机模型
+    使用固定COP计算冷却功耗: Power = HeatLoad / COP
     """
     def __init__(self):
         self.rated_capacity = Config.chiller_rated_capacity  # kW
-        self.rated_cop = Config.chiller_rated_cop
-        self.min_plr = Config.chiller_min_plr
-        
-        # 性能曲线系数
-        self.cop_plr_coef = Config.chiller_cop_plr_coef
-        self.temp_coef = Config.chiller_temp_coef
-        
-        # 运行状态
-        self.is_running = False
-        self.runtime = 0.0  # hours
-        self.startup_energy_cost = 0.0
-        
-    def _compute_cop_plr(self, plr):
-        """
-        计算部分负荷率下的COP修正系数
-        基于三次多项式拟合实际冷水机组性能曲线
-        COP_factor = a0 + a1*PLR + a2*PLR^2 + a3*PLR^3
-        """
-        plr = np.clip(plr, self.min_plr, 1.0)
-        a0, a1, a2, a3 = self.cop_plr_coef
-        cop_factor = a0 + a1*plr + a2*(plr**2) + a3*(plr**3)
-        # 确保COP因子在合理范围内
-        return np.clip(cop_factor, 0.3, 1.2)
+        self.cop = Config.chiller_rated_cop
     
-    def _compute_cop_temp(self, ambient_temp):
+    def compute_power(self, heat_load_kw):
         """
-        计算环境温度对COP的影响
-        COP_temp_factor = b0 + b1*T + b2*T^2
-        """
-        b0, b1, b2 = self.temp_coef
-        temp_factor = b0 + b1*ambient_temp + b2*(ambient_temp**2)
-        return np.clip(temp_factor, 0.5, 1.5)
-    
-    def compute_power(self, heat_load_kw, ambient_temp=None, dt=None):
-        """
-        计算冷却所需功率(非线性)
+        计算冷却所需功率 (线性)
         
         参数:
         - heat_load_kw: 需要移除的热负荷 (kW)
-        - ambient_temp: 环境温度 (K), 默认使用名义温度
-        - dt: 时间步长 (hours), 用于计算启停
         
         返回:
         - power_kw: 冷却机功耗 (kW)
         """
         if heat_load_kw <= 0:
-            self.is_running = False
-            self.runtime = 0.0
             return 0.0
         
-        # 使用默认环境温度
-        if ambient_temp is None:
-            ambient_temp = Config.ambient_temp_nominal
-        if dt is None:
-            dt = Config.dt
-        
-        # 计算部分负荷率
-        plr = heat_load_kw / self.rated_capacity
-        
-        # 如果低于最小负荷，按最小负荷运行
-        if plr < self.min_plr:
-            actual_plr = self.min_plr
-            # 实际只需要处理部分热量，但机组按最小负荷运行
-        else:
-            actual_plr = min(plr, 1.0)
-        
-        # 计算实际COP
-        cop_plr_factor = self._compute_cop_plr(actual_plr)
-        cop_temp_factor = self._compute_cop_temp(ambient_temp)
-        actual_cop = self.rated_cop * cop_plr_factor * cop_temp_factor
-        
-        # 基础功耗
-        base_power = (actual_plr * self.rated_capacity) / actual_cop
-        
-        # 启停惩罚
-        startup_penalty = 0.0
-        if not self.is_running:
-            # 首次启动，产生启动能耗
-            startup_penalty = Config.chiller_startup_energy / dt  # kW
-            self.is_running = True
-            self.runtime = 0.0
-        
-        self.runtime += dt
-        
-        total_power = base_power + startup_penalty
-        return total_power
+        # 限制在额定容量内
+        actual_load = min(heat_load_kw, self.rated_capacity)
+        power_kw = actual_load / self.cop
+        return power_kw
     
     def reset(self):
         """重置冷却机状态"""
-        self.is_running = False
-        self.runtime = 0.0
-        self.startup_energy_cost = 0.0
+        pass
 
 
 class HydrogenTank:
