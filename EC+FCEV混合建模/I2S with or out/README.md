@@ -36,6 +36,23 @@
 
 ## 更新日志
 
+**v3.4 (2026-02-08) - I2S 约束对比与成像**
+
+- **新增 I2S / 非 I2S 两套环境版本**
+  - `HydrogenEnv(enable_i2s_constraint=True/False)` 参数化控制 I2S 终端惩罚
+  - 同一环境代码内支持两种约束模式切换
+
+- **五算法双条件对比成像**
+  - 新脚本 `compare.py` 同时比较 I2S 与非 I2S 两种条件
+  - 输出 2×2 图像：有 I2S/无 I2S 的 Reward 与 Average Profit
+  - 训练接口整合：On-Policy + Off-Policy 统一对比
+
+- **文件命名优化**
+  - `compare_algorithms.py` → `compare.py`（更短）
+  - `main.py` → `single_algo_test.py`（单算法测试脚本，默认不运行）
+
+---
+
 **v3.3 (2026-02-06) - 多算法对比框架**
 
 - **新增 A2C 算法 (Advantage Actor-Critic, On-Policy)**
@@ -561,8 +578,15 @@ matplotlib
 ### 运行训练
 
 ```bash
-cd PPO
-python main.py
+cd "I2S with or out"
+python single_algo_test.py
+```
+
+### 运行五算法对比 (含 I2S/无 I2S)
+
+```bash
+cd "I2S with or out"
+python compare.py
 ```
 
 训练完成后将显示:
@@ -570,6 +594,7 @@ python main.py
 - 储能套利统计
 - 电池BESS统计
 - **压缩机系统统计** (v3.1新增)
+- **I2S/非 I2S 四图成像** (v3.4新增)
 
 ---
 
@@ -665,18 +690,18 @@ v3.1影响:
 ## 文件结构
 
 ```
-PPO/
+I2S with or out/
 ├── PPO.py                  # PPO算法 (On-Policy, Clipped Surrogate + GAE)
 ├── A2C.py                  # A2C算法 (On-Policy, 直接策略梯度) [v3.3新增]
 ├── SAC.py                  # SAC算法 (Off-Policy, 最大熵 + 自动温度)
 ├── TD3.py                  # TD3算法 (Off-Policy, Twin Critics + Delayed Update)
 ├── DDPG.py                 # DDPG算法 (Off-Policy, 单Critic确定性策略) [v3.3新增]
-├── compare_algorithms.py   # 五算法对比脚本 (训练+可视化) [v3.3升级]
-├── env.py                  # 氢电集成环境
+├── compare.py              # I2S/非I2S五算法对比脚本 (训练+可视化) [v3.4]
+├── env.py                  # 氢电集成环境 (I2S可切换)
 ├── components.py           # 物理组件 (v3.1压缩机优化, v3.2线性Chiller)
 ├── config.py               # 配置参数 (v3.2简化: 移除阈值策略, 线性Chiller)
 ├── data_loader.py          # 真实数据加载
-├── main.py                 # PPO训练主程序 (v3.1压缩机统计)
+├── single_algo_test.py     # 单算法训练脚本 (PPO默认)
 └── README.md               # 本文档
 ```
 
@@ -903,6 +928,6 @@ TOTAL Compressor Savings: 1616.60 kWh (23.0%)
 
 ---
 
-**最后更新**: 2026-02-06  
-**当前版本**: v3.3 (Multi-Algorithm Comparison)  
+**最后更新**: 2026-02-08  
+**当前版本**: v3.4 (I2S With/Without Comparison)  
 **作者**: Loogle
