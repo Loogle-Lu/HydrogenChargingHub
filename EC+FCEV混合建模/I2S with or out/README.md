@@ -36,6 +36,47 @@
 
 ## 更新日志
 
+**v3.6 (2026-02-11) - 动作空间扩展 4→8 维**
+
+- **新增 4 维动作**
+  - `battery_ratio` [0,1]: 0=倾向放电, 0.5=中性, 1=倾向充电；缩放电池充放电功率
+  - `bypass_bias` [0,1]: 0=保守(压力阈值0.9), 1=积极(0.7)；调节旁路激活条件
+  - `c3_pressure_bias` [0,1]: 0.5=默认, 0=降压省功耗, 1=升压快充；缩放 C3 目标压力
+  - `chiller_ratio` [0,1]: 0=最小制冷(30%), 1=全制冷；缩放 Chiller 功耗
+- **修改**: `_check_bypass`、`_compute_adaptive_target_pressure`、`LinearChiller.compute_power` 支持新参数；电池逻辑引入 `battery_ratio` 缩放
+- **兼容**: 4 维旧动作自动补齐至 8 维
+
+---
+
+**v3.5 (2026-02-11) - 动作空间扩展 2→4 维 [压缩机创新点增强]**
+
+- **动作空间维度扩展 (2D → 4D)**
+  - 原动作: `[ele_ratio, fc_ratio]` 仅控制电解槽和燃料电池
+  - 新动作: `[ele_ratio, fc_ratio, comp_load_ratio, cooling_intensity]`
+  - **comp_load_ratio** [0,1]: 压缩负载比例，映射到流量 [0.4, 1.0]，关联 VSD 效率曲线
+    - Agent 可学习在电价低时提高压缩负载、电价高时降低，以优化能效
+  - **cooling_intensity** [0,1]: 级间冷却强度
+    - 0 = 轻度冷却（省冷却器电耗），1 = 深度冷却（省压缩机功耗）
+    - Agent 可学习电价与冷却/压缩的权衡
+
+- **环境与奖励优化（改善训练曲线）**
+  - `arbitrage_bonus_coef`: 100 → 50，降低人工奖励比重，让 Profit 信号主导
+  - `soc_health_bonus`: 50 → 20，减少 SOC 健康奖励幅度
+  - `i2s_penalty_weight`: 2000 → 1500，适度放宽 I2S 约束
+  - 新增奖励裁剪: `clip(step_reward, -5000, 5000)`，抑制极端值
+
+- **Components 修改**
+  - `Compressor._compute_intercool_temp()` 支持 `cooling_intensity` 参数
+  - `MultiStageCompressorSystem.compute_c1()` / `compute_c2()` 支持 RL Agent 传入冷却强度
+  - 动作空间 2D 向后兼容: 传入 2 维动作时自动补齐 `comp_load_ratio=0.7`, `cooling_intensity=0.7`
+
+- **single_algo_test.py 重构**
+  - 改为 SAC (无 Transformer) 有/无 I2S 对比测试
+  - 输出 2×2 图: With I2S Reward/Profit | Without I2S Reward/Profit
+  - 用于单独评估 SAC 在两种 I2S 条件下的性能差异
+
+---
+
 **v3.4 (2026-02-08) - I2S 约束对比与成像**
 
 - **新增 I2S / 非 I2S 两套环境版本**
@@ -653,16 +694,20 @@ python compare.py
 ]
 ```
 
-## 动作空间 (2维)
+## 动作空间 (8维, v3.6)
 
 ```python
 [
-    电解槽功率比例,     # 0-1 (×1000kW)
-    燃料电池功率比例,   # 0-1 (×500kW)
+    电解槽功率比例,       # 0-1 (×1000kW)
+    燃料电池功率比例,     # 0-1 (×500kW)
+    comp_load_ratio,      # 0-1 压缩负载 (VSD)
+    cooling_intensity,    # 0-1 级间冷却强度
+    battery_ratio,       # 0-1 充放电倾向 (0放电 1充电)
+    bypass_bias,          # 0-1 旁路倾向 (0保守 1积极)
+    c3_pressure_bias,     # 0-1 C3目标压力 (0降压 1升压)
+    chiller_ratio,       # 0-1 Chiller制冷强度
 ]
 ```
-
-注: 压缩机控制由系统自动优化 (VSD/旁路/冷却/压力)
 
 ---
 

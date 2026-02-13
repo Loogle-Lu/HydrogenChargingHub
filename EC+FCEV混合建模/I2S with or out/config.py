@@ -19,8 +19,8 @@ class Config:
 
     # [修改] 降低I2S惩罚权重，避免过度保守
     # 原值10000导致Agent不敢制氢（害怕SOC偏离）
-    # 新值2000仍有约束作用，但允许更多探索
-    i2s_penalty_weight = 2000.0
+    # v3.5: 2000→1500 进一步放宽，改善Profit曲线向下趋势
+    i2s_penalty_weight = 1500.0
 
     # --- 物理组件参数 ---
     # 1. 电解槽
@@ -222,7 +222,9 @@ class Config:
     
     # 储能套利激励参数 (新增)
     enable_arbitrage_bonus = True  # 启用储能套利奖励
-    arbitrage_bonus_coef = 100.0  # 套利奖励系数
+    # v3.5: 100→50 降低人工奖励比重，让Profit信号主导，改善训练曲线
+    arbitrage_bonus_coef = 50.0  # 套利奖励系数
+    soc_health_bonus = 20.0  # SOC在[0.4,0.6]时的健康奖励 (原硬编码50)
     price_threshold_low = 0.06  # $/kWh (低电价阈值，低于此值鼓励制氢)
     price_threshold_high = 0.10  # $/kWh (高电价阈值，高于此值鼓励放电)
     

@@ -26,9 +26,9 @@ class HydrogenEnv(gym.Env):
         self.service_station = IntegratedServiceStation()
 
         self.current_step = 0
-        # 动作空间: [ele_ratio, fc_ratio]
-        # Agent控制电解槽和燃料电池，压缩机和服务站自动运行
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
+        # 动作空间 (v3.6 扩展至8维):
+        # [ele_ratio, fc_ratio, comp_load_ratio, cooling_intensity, battery_ratio, bypass_bias, c3_pressure_bias, chiller_ratio]
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(8,), dtype=np.float32)
         
         # 观察空间扩展: 
         # [总SOC, T1_SOC, T2_SOC, 电池SOC, 电价, 可再生能源, EV队列长度, FCEV队列长度, 时段]
@@ -72,8 +72,21 @@ class HydrogenEnv(gym.Env):
         return self.state
     
     def step(self, action):
+        action = np.asarray(action, dtype=np.float32).flatten()
+        if len(action) < 8:
+            # 向后兼容: 旧维度用默认值补齐
+            defaults = [0.7, 0.7, 0.7, 0.5, 0.5, 0.5, 0.5, 0.7]  # ele,fc,comp,cool,batt,bypass,c3p,chill
+            pad_len = 8 - len(action)
+            action = np.concatenate([action, np.array(defaults[len(action):8])])
+
         ele_ratio = np.clip(action[0], 0, 1)
         fc_ratio = np.clip(action[1], 0, 1)
+        comp_load_ratio = np.clip(action[2], 0, 1)
+        cooling_intensity = np.clip(action[3], 0, 1)
+        battery_ratio = np.clip(action[4], 0, 1)      # 0=倾向放电 0.5=中性 1=倾向充电
+        bypass_bias = np.clip(action[5], 0, 1)        # 0=保守 1=积极旁路
+        c3_pressure_bias = np.clip(action[6], 0, 1)   # 0.5=默认 0=降压 1=升压
+        chiller_ratio = np.clip(action[7], 0, 1)      # 0=最小制冷 1=全制冷
 
         price = self.current_data["price"]
         re_gen = self.current_data["wind"] + self.current_data["pv"]
@@ -109,36 +122,44 @@ class HydrogenEnv(gym.Env):
         # 获取当前FCEV平均SOG (用于自适应压力控制)
         avg_fcev_sog = self.service_station.current_fcev_avg_sog
         
-        # C1流量: 基于T1 SOC自适应
-        c1_flow = h2_produced * min(1.0, max(0.5, t1_soc))
+        # C1流量: 基于T1 SOC自适应，并由 comp_load_ratio 调节 (VSD效率关联)
+        c1_flow_base = h2_produced * min(1.0, max(0.5, t1_soc))
+        comp_scale = 0.4 + 0.6 * comp_load_ratio  # [0.4, 1.0]，保证最低流量维持系统运行
+        c1_flow = c1_flow_base * comp_scale
         t2_pressure = Config.c1_output_pressure * t2_soc
         c1_power, c1_heat = self.comp_system.compute_c1(
-            c1_flow, 
+            c1_flow,
             tank_pressure=t2_pressure,
-            electricity_price=price
+            electricity_price=price,
+            cooling_intensity=cooling_intensity,
+            bypass_bias=bypass_bias
         )
         
-        # C2流量: 基于T2 SOC和FCEV需求
-        c2_flow = c1_flow * min(1.0, max(0.4, t2_soc)) + fcev_h2_demand * 0.5
+        c2_flow_base = c1_flow_base * min(1.0, max(0.4, t2_soc)) + fcev_h2_demand * 0.5
+        c2_flow = c2_flow_base * comp_scale
         c2_power, c2_heat = self.comp_system.compute_c2(
             c2_flow,
             tank_pressure=t3_avg_pressure,
-            electricity_price=price
+            electricity_price=price,
+            cooling_intensity=cooling_intensity,
+            bypass_bias=bypass_bias
         )
         
-        # C3流量: 主要为FCEV快充（自适应压力）
-        c3_flow = fcev_h2_demand * 0.3  # 30%通过C3超高压
+        c3_flow_base = fcev_h2_demand * 0.3
+        c3_flow = c3_flow_base * (0.6 + 0.4 * comp_load_ratio)
         c3_power, c3_heat = self.comp_system.compute_c3(
             c3_flow,
             avg_fcev_sog=avg_fcev_sog,
             tank_pressure=t4_pressure,
-            electricity_price=price
+            electricity_price=price,
+            bypass_bias=bypass_bias,
+            c3_pressure_bias=c3_pressure_bias
         )
         
         total_comp_heat = c1_heat + c2_heat + c3_heat
         
-        # --- 7. 线性Chiller ---
-        chiller_power = self.chiller.compute_power(total_comp_heat)
+        # --- 7. 线性Chiller (v3.6: chiller_ratio 控制制冷强度) ---
+        chiller_power = self.chiller.compute_power(total_comp_heat, chiller_ratio=chiller_ratio)
         
         # --- 8. 总电力负荷 ---
         # 制氢链负荷
@@ -173,31 +194,26 @@ class HydrogenEnv(gym.Env):
         real_fc_h2_used = h2_needed_for_fc * supply_ratio
         fc_actual_power, _ = self.fc.compute(real_fc_h2_used)
 
-        # --- 11. 电池储能系统 (v2.6新增: 快速调峰与功率平滑) ---
+        # --- 11. 电池储能系统 (v3.6: battery_ratio 控制充放电倾向) ---
         battery_charge_power = 0.0
         battery_discharge_power = 0.0
-        battery_net_power = 0.0  # 电池净输出功率 (放电为正，充电为负)
+        battery_net_power = 0.0
         
         if Config.enable_battery_storage:
-            # 初步计算电力缺口 (不含电池)
             available_re_for_grid = re_gen - power_from_re
             preliminary_net = (fc_actual_power + available_re_for_grid) - (total_load - ele_actual_power)
-            
-            # 电池充放电策略:
-            # 1. 当有功率剩余 (preliminary_net > 0): 充电存储
-            # 2. 当有功率缺口 (preliminary_net < 0): 放电补充
-            # 3. 优先级: 电池 > 电网 (电池响应快，效率高)
-            
-            if preliminary_net > 50:  # 有剩余功率，充电
-                battery_charge_power, _ = self.battery.charge(preliminary_net)
-                battery_net_power = -battery_charge_power  # 充电为负
-            elif preliminary_net < -50:  # 功率缺口，放电
-                battery_discharge_power, _ = self.battery.discharge(-preliminary_net)
-                battery_net_power = battery_discharge_power  # 放电为正
+            # battery_ratio: 0=倾向放电, 0.5=中性, 1=倾向充电
+            if preliminary_net > 50:
+                power_to_charge = preliminary_net * (0.5 + battery_ratio)
+                battery_charge_power, _ = self.battery.charge(power_to_charge)
+                battery_net_power = -battery_charge_power
+            elif preliminary_net < -50:
+                power_to_discharge = (-preliminary_net) * (1.5 - battery_ratio)
+                battery_discharge_power, _ = self.battery.discharge(power_to_discharge)
+                battery_net_power = battery_discharge_power
         
         # --- 12. 电网互动与财务 (含储能套利奖励 + 电池) ---
         # 电力平衡: 供应 - 需求
-        # 注意: 电解槽消耗的RE已经在power_from_re中体现，不重复计算
         available_re_for_grid = re_gen - power_from_re  # 剩余可再生能源
         net_power = (fc_actual_power + available_re_for_grid + battery_net_power) - (total_load - ele_actual_power)
 
@@ -219,45 +235,32 @@ class HydrogenEnv(gym.Env):
                 arbitrage_bonus += fc_actual_power * Config.dt * price_advantage * Config.arbitrage_bonus_coef
             
             # SOC健康度奖励（鼓励维持在合理范围）
-            soc_health_bonus = 0.0
             if 0.4 <= current_soc <= 0.6:
-                soc_health_bonus = 50.0  # SOC在健康范围内给予奖励
-            arbitrage_bonus += soc_health_bonus
+                arbitrage_bonus += Config.soc_health_bonus
         
-        # 电力成本/收入计算 (v3.1修正: 更真实的成本核算)
-        # 
-        # 核心理念：
-        # 1. 制氢生产链用电（电解槽+压缩机+冷却器）应计入成本，无论电力来源
-        #    - 如果用RE：机会成本（本可以卖给电网）
-        #    - 如果用Grid：直接成本
-        # 2. EV充电直接向用户收费，不计入Grid Cost
-        # 3. 燃料电池发电是收入
-        
+        # 电力成本/收入计算
         # 制氢生产链总负载
         h2_production_load_total = ele_actual_power + c1_power + c2_power + c3_power + chiller_power
         
-        # 制氢生产链的电力成本（按当前电价计算）
-        # 这反映了：用RE制氢的机会成本 + 从电网购电的直接成本
-        cost_h2_production = h2_production_load_total * price * Config.dt  # kW × $/kWh × h = $
+        # 制氢生产链的电力成本
+        cost_h2_production = h2_production_load_total * price * Config.dt
         
-        # 电网交互成本/收入（净购售电）
-        cost_grid_purchase = 0
+        # 电网交互成本/收入
         revenue_grid = 0
         if net_power < 0:
-            # 从电网购电
-            cost_grid_purchase = abs(net_power) * price * Config.dt
+            # 这里的购电成本已经包含在 cost_h2_production 里了（理论上），
+            # 但为了财务统计清晰，我们假设 cost_h2_production 是所有设备的运行成本，
+            # 而 revenue_grid 是净售电收益。
+            # 如果 net_power < 0，说明需要购电，但 cost_h2_production 已经计算了全额电费。
+            # 这里 net_power < 0 时，revenue_grid = 0
+            pass
         else:
             # 向电网售电
             revenue_grid = net_power * price * Config.electricity_price_sell_coef * Config.dt
         
-        # 总电网成本 = 制氢生产成本 + 净购电成本（如果有的话）
-        # 注意：制氢生产成本已经包含了所有用电，net_power是在此之后的净交互
-        # 所以总成本应该是制氢生产成本
-        cost_grid = cost_h2_production  # 主要成本
+        # 统一使用 cost_grid 代表电网侧的总支出 (简化模型：全额设备耗电按网电价计成本)
+        cost_grid = cost_h2_production
         
-        # 如果还需要从电网额外购电（net_power < 0），说明RE+FC不够
-        # 这部分已经包含在制氢生产成本中了，不需要重复计算
-
         # 惩罚
         penalty = service_penalty  # 未满足服务惩罚
         if shortage_h2 > 0: 
@@ -265,9 +268,18 @@ class HydrogenEnv(gym.Env):
         if excess_h2 > 0: 
             penalty += excess_h2 * 10
 
-        # 总收益 (包含储能套利奖励)
-        step_reward = revenue_ev + revenue_fcev + revenue_grid + arbitrage_bonus - cost_grid - penalty
-        step_profit = revenue_ev + revenue_fcev + revenue_grid + arbitrage_bonus - cost_grid
+        # =========================================================================
+        # [核心修正 v3.5] 区分 "真实利润(Profit)" 和 "强化学习奖励(Reward)"
+        # =========================================================================
+        
+        # 1. 真实经济利润 (用于绘图和评估): 真金白银，不含人工奖励
+        #    Profit = EV收入 + FCEV收入 + 售电收入 - 电费成本
+        step_profit = revenue_ev + revenue_fcev + revenue_grid - cost_grid
+
+        # 2. 强化学习奖励 (用于训练): 包含人工引导信号(arbitrage_bonus) 和 惩罚
+        #    Reward = Profit + 人工奖励 - 惩罚
+        step_reward = step_profit + arbitrage_bonus - penalty
+        # =========================================================================
 
         self.current_step += 1
         done = self.current_step >= Config.episode_length
@@ -278,6 +290,9 @@ class HydrogenEnv(gym.Env):
             init_soc = Config.storage_initial
             i2s_penalty = abs(final_soc - init_soc) * Config.i2s_penalty_weight
             step_reward -= i2s_penalty
+
+        # --- v3.5: 奖励裁剪，抑制极端值以稳定训练 ---
+        step_reward = np.clip(step_reward, -5000.0, 5000.0)
 
         # --- 更新状态 ---
         self.current_data = self.data_loader.get_step_data(self.current_step)
@@ -300,18 +315,19 @@ class HydrogenEnv(gym.Env):
 
         info = {
             "soc": soc,
-            "profit": step_profit,
+            "profit": step_profit,  # 现在这是真实的经济利润
+            "reward": step_reward,  # 这是包含Bonus的训练奖励
             "net_power": net_power,
             "re_gen": re_gen,
             "fc_power": fc_actual_power,
-            "load_power": total_load,  # 兼容main.py
+            "load_power": total_load,
             "h2_production_load": h2_production_load,
             "ev_charging_load": ev_power_demand,
             "total_load": total_load,
             "comp_power": c1_power + c2_power + c3_power,
-            "comp_c1_power": c1_power,  # v3.1: 单独追踪C1功耗
-            "comp_c2_power": c2_power,  # v3.1: 单独追踪C2功耗
-            "comp_c3_power": c3_power,  # v3.1: 单独追踪C3功耗
+            "comp_c1_power": c1_power,
+            "comp_c2_power": c2_power,
+            "comp_c3_power": c3_power,
             "chiller_power": chiller_power,
             "tank_socs": self.storage.get_tank_socs(),
             # EV/FCEV统计
@@ -330,18 +346,26 @@ class HydrogenEnv(gym.Env):
             # 储能套利统计
             "arbitrage_bonus": arbitrage_bonus,
             "price": price,
-            # 电池储能统计 (v2.6新增)
+            # 电池储能统计
             "battery_soc": self.battery.get_soc(),
             "battery_charge_power": battery_charge_power,
             "battery_discharge_power": battery_discharge_power,
             "battery_net_power": battery_net_power,
-            # v3.1: 收益分解
-            "revenue_ev": ev_revenue,
-            "revenue_fcev": fcev_revenue,
+            # 收益分解
+            "revenue_ev": revenue_ev,
+            "revenue_fcev": revenue_fcev,
             "revenue_grid": revenue_grid,
             "cost_grid": cost_grid,
+            # 控制动作 (v3.5/v3.6)
+            "comp_load_ratio": comp_load_ratio,
+            "cooling_intensity": cooling_intensity,
+            "battery_ratio": battery_ratio,
+            "bypass_bias": bypass_bias,
+            "c3_pressure_bias": c3_pressure_bias,
+            "chiller_ratio": chiller_ratio,
             # 兼容旧版
-            "h2_sold": fcev_h2_demand * supply_ratio  # 近似值
+            "h2_sold": fcev_h2_demand * supply_ratio
         }
 
+        # v3.5: 奖励缩放 (100) 保持梯度尺度适中
         return self.state, step_reward / 100.0, done, info

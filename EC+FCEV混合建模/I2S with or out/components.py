@@ -103,14 +103,24 @@ class Compressor:
                     return eta
         return self.nominal_eta
     
-    def _compute_intercool_temp(self, electricity_price):
+    def _compute_intercool_temp(self, electricity_price, cooling_intensity=None):
         """
         v3.1: 计算动态级间冷却温度
         电价高 -> 轻度冷却（节省冷却器电耗）
         电价低 -> 深度冷却（降低压缩机功耗）
+        
+        v3.2: 支持 RL Agent 控制 cooling_intensity [0,1]
+        - cooling_intensity=0: 轻度冷却 (max_temp, 节省冷却器电耗)
+        - cooling_intensity=1: 深度冷却 (min_temp, 降低压缩机功耗)
+        - 当 cooling_intensity 为 None 时，使用原电价启发式
         """
         if not Config.enable_dynamic_cooling:
             return Config.T_in  # 默认回到进口温度
+        
+        if cooling_intensity is not None:
+            # RL Agent 直接控制: 0=轻度, 1=深度
+            T_cool = Config.max_intercool_temp - (Config.max_intercool_temp - Config.min_intercool_temp) * cooling_intensity
+            return float(np.clip(T_cool, Config.min_intercool_temp, Config.max_intercool_temp))
         
         if electricity_price > Config.cooling_price_threshold:
             # 高电价: 轻度冷却
@@ -122,11 +132,12 @@ class Compressor:
             T_cool = Config.min_intercool_temp + (Config.max_intercool_temp - Config.min_intercool_temp) * price_ratio
             return T_cool
 
-    def compute_power(self, mass_flow_kg_h, electricity_price=0.08):
+    def compute_power(self, mass_flow_kg_h, electricity_price=0.08, cooling_intensity=None):
         """
         计算压缩功耗和产生的热量
         
         v3.1: 新增电价参数用于动态冷却优化
+        v3.2: 新增 cooling_intensity 参数供 RL Agent 控制级间冷却强度
         """
         if mass_flow_kg_h <= 0:
             return 0.0, 0.0
@@ -144,8 +155,8 @@ class Compressor:
         
         if self.use_two_stage:
             # 两级压缩
-            # v3.1: 动态级间冷却温度
-            T_intercool = self._compute_intercool_temp(electricity_price)
+            # v3.1/v3.2: 动态级间冷却温度 (支持 Agent 控制的 cooling_intensity)
+            T_intercool = self._compute_intercool_temp(electricity_price, cooling_intensity)
             
             # 第一级: p_in -> p_mid
             term1 = (self.p_mid / self.p_in) ** self.exponent - 1
@@ -247,92 +258,86 @@ class MultiStageCompressorSystem:
         self.bypass_activations = {'c1': 0, 'c2': 0, 'c3': 0}
         self.energy_saved_by_bypass = 0.0  # kWh
     
-    def _check_bypass(self, tank_pressure, target_pressure, demand):
+    def _check_bypass(self, tank_pressure, target_pressure, demand, bypass_bias=None):
         """
         v3.1: 判断是否可以启用旁路
-        
-        条件:
-        1. 储罐压力 >= 目标压力 × 阈值
-        2. 需求 <= 旁路需求阈值
+        v3.6: bypass_bias [0,1] 0=保守(阈值0.9) 1=积极(阈值0.7)
         """
         if not Config.enable_bypass:
             return False
         
-        pressure_ok = tank_pressure >= target_pressure * Config.bypass_pressure_threshold
+        if bypass_bias is not None:
+            # bypass_bias=0 保守(高阈值0.9), bypass_bias=1 积极(低阈值0.7)
+            eff_threshold = 0.9 - 0.2 * np.clip(bypass_bias, 0, 1)
+        else:
+            eff_threshold = Config.bypass_pressure_threshold
+        pressure_ok = tank_pressure >= target_pressure * eff_threshold
         demand_ok = demand <= Config.bypass_demand_threshold
-        
         return pressure_ok and demand_ok
     
-    def _compute_adaptive_target_pressure(self, avg_fcev_sog):
+    def _compute_adaptive_target_pressure(self, avg_fcev_sog, c3_pressure_bias=None):
         """
         v3.1: 根据FCEV平均SOG计算自适应目标压力
-        
-        SOG分段充装策略:
-        - 0-30%: 700bar (快速充装)
-        - 30-60%: 500bar (中速充装)
-        - 60-80%: 350bar (慢速充装)
-        - 80%+: 200bar (涓流充电)
+        v3.6: c3_pressure_bias [0,1] 0.5=默认, 0=降压省功耗, 1=升压快充
         """
         if not Config.enable_adaptive_pressure:
-            return Config.c3_output_pressure  # 固定700bar
+            base = Config.c3_output_pressure
+        else:
+            map_points = sorted(Config.adaptive_pressure_map.keys())
+            for i in range(len(map_points)):
+                if avg_fcev_sog <= map_points[i]:
+                    base = Config.adaptive_pressure_map[map_points[i]]
+                    break
+            else:
+                base = Config.adaptive_pressure_map[map_points[-1]]
         
-        # 从映射表查找目标压力
-        map_points = sorted(Config.adaptive_pressure_map.keys())
-        for i in range(len(map_points)):
-            if avg_fcev_sog <= map_points[i]:
-                return Config.adaptive_pressure_map[map_points[i]]
-        
-        # 超过最大SOG，返回最低压力
-        return Config.adaptive_pressure_map[map_points[-1]]
+        if c3_pressure_bias is not None:
+            # 0.5→1.0倍, 0→0.6倍, 1→1.4倍
+            scale = 0.6 + 0.8 * np.clip(c3_pressure_bias, 0, 1)
+            return min(base * scale, Config.c3_output_pressure)
+        return base
     
-    def compute_c1(self, mass_flow, tank_pressure=0, electricity_price=0.08):
+    def compute_c1(self, mass_flow, tank_pressure=0, electricity_price=0.08, cooling_intensity=None, bypass_bias=None):
         """
         C1压缩: T1(2bar) -> T2(35bar)
-        
-        v3.1: 增加旁路判断
+        v3.6: 支持 bypass_bias
         """
-        if Config.enable_bypass and self._check_bypass(tank_pressure, Config.c1_output_pressure, mass_flow):
+        if Config.enable_bypass and self._check_bypass(tank_pressure, Config.c1_output_pressure, mass_flow, bypass_bias):
             # 旁路激活: T2压力足够，直接供气
             self.bypass_activations['c1'] += 1
             
             # 估算节省的能量（正常压缩功耗）
-            normal_power, _ = self.c1.compute_power(mass_flow, electricity_price)
+            normal_power, _ = self.c1.compute_power(mass_flow, electricity_price, cooling_intensity)
             self.energy_saved_by_bypass += normal_power * Config.dt
             
             return 0.0, 0.0  # 旁路：功耗和热量均为0
         
-        return self.c1.compute_power(mass_flow, electricity_price)
+        return self.c1.compute_power(mass_flow, electricity_price, cooling_intensity)
     
-    def compute_c2(self, mass_flow, tank_pressure=0, electricity_price=0.08):
+    def compute_c2(self, mass_flow, tank_pressure=0, electricity_price=0.08, cooling_intensity=None, bypass_bias=None):
         """
         C2压缩: T2(35bar) -> T3系统(500bar)
-        
-        v3.1: 增加旁路判断
+        v3.6: 支持 bypass_bias
         """
-        if Config.enable_bypass and self._check_bypass(tank_pressure, Config.c2_output_pressure, mass_flow):
+        if Config.enable_bypass and self._check_bypass(tank_pressure, Config.c2_output_pressure, mass_flow, bypass_bias):
             # 旁路激活
             self.bypass_activations['c2'] += 1
             
-            normal_power, _ = self.c2.compute_power(mass_flow, electricity_price)
+            normal_power, _ = self.c2.compute_power(mass_flow, electricity_price, cooling_intensity)
             self.energy_saved_by_bypass += normal_power * Config.dt
             
             return 0.0, 0.0
         
-        return self.c2.compute_power(mass_flow, electricity_price)
+        return self.c2.compute_power(mass_flow, electricity_price, cooling_intensity)
     
-    def compute_c3(self, mass_flow, avg_fcev_sog=0.5, tank_pressure=0, electricity_price=0.08):
+    def compute_c3(self, mass_flow, avg_fcev_sog=0.5, tank_pressure=0, electricity_price=0.08,
+                   bypass_bias=None, c3_pressure_bias=None):
         """
         C3压缩: T3/T4 -> D2 LDFV(700bar)
-        
-        v3.1: 
-        1. 自适应压力控制（根据FCEV SOG）
-        2. 旁路判断
+        v3.6: 支持 bypass_bias, c3_pressure_bias
         """
-        # 计算自适应目标压力
-        target_pressure = self._compute_adaptive_target_pressure(avg_fcev_sog)
-        
-        # 检查旁路
-        if Config.enable_bypass and self._check_bypass(tank_pressure, target_pressure, mass_flow):
+        target_pressure = self._compute_adaptive_target_pressure(avg_fcev_sog, c3_pressure_bias)
+        if Config.enable_bypass and self._check_bypass(tank_pressure, target_pressure, mass_flow, bypass_bias):
             self.bypass_activations['c3'] += 1
             
             # 使用原有目标压力估算节能（保守估计）
@@ -410,22 +415,17 @@ class LinearChiller:
         self.rated_capacity = Config.chiller_rated_capacity  # kW
         self.cop = Config.chiller_rated_cop
     
-    def compute_power(self, heat_load_kw):
+    def compute_power(self, heat_load_kw, chiller_ratio=None):
         """
         计算冷却所需功率 (线性)
-        
-        参数:
-        - heat_load_kw: 需要移除的热负荷 (kW)
-        
-        返回:
-        - power_kw: 冷却机功耗 (kW)
+        v3.6: chiller_ratio [0,1] 0=最小制冷(30%), 1=全制冷
         """
         if heat_load_kw <= 0:
             return 0.0
-        
-        # 限制在额定容量内
         actual_load = min(heat_load_kw, self.rated_capacity)
         power_kw = actual_load / self.cop
+        if chiller_ratio is not None:
+            power_kw *= (0.3 + 0.7 * np.clip(chiller_ratio, 0, 1))
         return power_kw
     
     def reset(self):
