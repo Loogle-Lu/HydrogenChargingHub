@@ -10,7 +10,7 @@
 - **制氢层**: 电解槽 → 氢气储罐(T1-T4) → 三级压缩机(C1→C2→C3)
 - **服务层**: EV充电站 + FCEV加氢站
 - **辅助层**: 冷却器(Chiller) 保障热管理
-- **控制层**: RL Agent实时优化调度 (PPO/A2C/SAC/TD3/DDPG 可对比)
+- **控制层**: RL Agent实时优化调度 (PPO/A2C/SAC/TD3/DDPG/REINFORCE/Random 可对比)
 - **能流标识**: 蓝色实线(电力) | 灰色虚线(氢气) | 橙色点线(控制信号)
 
 ---
@@ -28,13 +28,45 @@
 - **级联压缩机优化**: VSD变速驱动 + 智能旁路 + 动态冷却 + 自适应压力 (v3.1论文创新点)
 - **线性Chiller**: 固定COP线性冷却模型 (v3.2简化)  
 - **智能调度**: PPO强化学习Agent优化决策 (on-policy，样本高效)  
-- **多算法对比**: PPO vs A2C vs SAC vs TD3 vs DDPG (v3.3 新增)  
+- **多算法对比**: PPO vs A2C vs SAC vs TD3 vs DDPG vs REINFORCE vs Random (v3.3/v3.9)  
 - **多收入源**: EV充电 + FCEV加氢 + 电网售电 + 储能套利  
 - **双储能系统**: 电池BESS (快速调峰) + 氢储能 (长时储能)
 
 ---
 
 ## 更新日志
+**v3.9 (2026-02-17) - 新增双 Baseline**
+
+- **Random Baseline (`RandomBaseline.py`)**
+  - 无学习、无参数，每步从 `action_space` 均匀随机采样
+  - 作为性能下界，用于证明 RL 算法优于随机策略
+
+- **REINFORCE Baseline (`REINFORCE.py`)**
+  - 原始策略梯度 (Vanilla Policy Gradient)，Monte Carlo 回报
+  - 使用 Value 作为 Baseline 降低方差
+  - 与 PPO/A2C 对比，体现 GAE、Clipping 等改进技术的价值
+
+- **compare.py 升级为七算法对比**
+  - 新增 REINFORCE、Random 至成像曲线
+  - 算法列表: PPO | A2C | SAC | TD3 | DDPG | REINFORCE | Random
+  - 2×2 图 (With/Without I2S × Reward/Profit) 展示全部 7 条曲线
+
+---
+
+**v3.8 (2026-02-17) - 修改HRS盈利框架**
+
+- **电网交互模式重构**
+  - **移除售电收益**: 遵循实际站点“零出口 (Zero Export)”限制，多余光伏/风电不再能卖给电网赚钱，而是被标记为弃电 (Curtailment)。
+  - **确立“自发自用”核心**: 系统的经济性来源从“卖电套利”转变为**“反向供应削峰”**。在电价峰值期间，控制燃料电池 (FC) 和电池 (Battery) 放电供给站内 EV 充电桩，从而避免购买高价网电。
+  
+- **经济模型与奖励修正**
+  - **Profit 计算重定义**: `Profit = 服务收入 (EV+FCEV) - 电网购电成本 - 缺氢违约金`。
+  - **引入缺氢违约金**: 在 Profit 计算中显式加入缺氢惩罚 ($20/kg)，彻底解决了 PPO 算法此前“为了省电费而拒绝制氢”的策略漏洞，倒逼 Agent 必须优先满足氢气需求。
+  - **能量流向约束**: 明确了 `FC发电 + 电池放电 + 可再生能源` 优先满足站内负载 (EV/制氢/压缩/冷却)，仅当内部供给不足时才从电网购电。
+
+- **影响**: 
+  - 迫使 RL Agent 学习更精细的能量平衡策略：不仅要低价制氢，还要精准预测负载，防止发出的电被浪费（弃电），同时确保氢气供应以避免高额违约金。
+
 
 **v3.6 (2026-02-11) - 动作空间扩展 4→8 维**
 
@@ -71,7 +103,7 @@
   - 动作空间 2D 向后兼容: 传入 2 维动作时自动补齐 `comp_load_ratio=0.7`, `cooling_intensity=0.7`
 
 - **single_algo_test.py 重构**
-  - 改为 SAC (无 Transformer) 有/无 I2S 对比测试
+  - 改为 SAC 有/无 I2S 对比测试
   - 输出 2×2 图: With I2S Reward/Profit | Without I2S Reward/Profit
   - 用于单独评估 SAC 在两种 I2S 条件下的性能差异
 
@@ -623,7 +655,7 @@ cd "I2S with or out"
 python single_algo_test.py
 ```
 
-### 运行五算法对比 (含 I2S/无 I2S)
+### 运行七算法对比 (含 I2S/无 I2S)
 
 ```bash
 cd "I2S with or out"
@@ -741,7 +773,10 @@ I2S with or out/
 ├── SAC.py                  # SAC算法 (Off-Policy, 最大熵 + 自动温度)
 ├── TD3.py                  # TD3算法 (Off-Policy, Twin Critics + Delayed Update)
 ├── DDPG.py                 # DDPG算法 (Off-Policy, 单Critic确定性策略) [v3.3新增]
-├── compare.py              # I2S/非I2S五算法对比脚本 (训练+可视化) [v3.4]
+├── REINFORCE.py            # REINFORCE基线 (Vanilla Policy Gradient) [v3.9新增]
+├── RandomBaseline.py      # Random基线 (无学习随机策略) [v3.9新增]
+├── SAC_trans.py           # SAC+Transformer (序列特征) [v3.5]
+├── compare.py             # I2S/非I2S七算法对比脚本 (训练+可视化) [v3.4/v3.9]
 ├── env.py                  # 氢电集成环境 (I2S可切换)
 ├── components.py           # 物理组件 (v3.1压缩机优化, v3.2线性Chiller)
 ├── config.py               # 配置参数 (v3.2简化: 移除阈值策略, 线性Chiller)
@@ -947,7 +982,7 @@ TOTAL Compressor Savings: 1616.60 kWh (23.0%)
 
 1. PPO算法应用 - 工业标准RL
 2. **级联压缩机智能优化** - 论文核心创新
-3. **五算法对比框架** - PPO/A2C/SAC/TD3/DDPG (v3.3)
+3. **七算法对比框架** - PPO/A2C/SAC/TD3/DDPG/REINFORCE/Random (v3.3/v3.9)
 4. 双储能系统 - 电池+氢气协同
 5. 储能套利策略 - 低买高卖
 6. 真实需求建模 - EV/FCEV混合

@@ -1,5 +1,5 @@
 """
-五算法对比脚本: PPO vs A2C vs SAC vs TD3 vs DDPG
+七算法+双 Baseline 对比脚本: PPO vs A2C vs SAC vs TD3 vs DDPG vs REINFORCE vs Random
 
 对比维度:
 - I2S 约束开启 / 关闭
@@ -12,25 +12,30 @@
 """
 
 import numpy as np
+import torch
+import random
 import matplotlib.pyplot as plt
 import time
 from env import HydrogenEnv
 from PPO import PPO
 from A2C import A2C
-from SAC import SAC, ReplayBuffer, SequenceReplayBuffer
+from SAC import SAC, ReplayBuffer
 from TD3 import TD3
 from DDPG import DDPG
+from REINFORCE import REINFORCE
+from RandomBaseline import RandomBaseline
 
 
 # ======================== 配置 ========================
+NUM_RUNS = 3             # 每个算法重复运行次数，取平均值 (可调整)
 NUM_EPISODES = 100       # 每个算法训练的 Episode 数
 WARMUP_STEPS = 500       # Off-Policy 算法的随机探索步数
 BATCH_SIZE = 256         # Off-Policy 算法的 mini-batch 大小
 LR = 3e-4                # 统一学习率
 MA_WINDOW = 20           # 移动平均窗口大小
 
-# 算法列表 (按 On-Policy → Off-Policy 排列)
-ALGO_NAMES = ['PPO', 'A2C', 'SAC', 'TD3', 'DDPG']
+# 算法列表 (RL 算法 + Baseline)
+ALGO_NAMES = ['PPO', 'A2C', 'SAC', 'TD3', 'DDPG', 'REINFORCE', 'Random']
 
 # I2S 版本
 I2S_SETTINGS = [
@@ -38,14 +43,27 @@ I2S_SETTINGS = [
     (False, "Without I2S"),
 ]
 
-# 颜色方案 (5色)
+# 颜色方案 (7色)
 COLORS = {
-    'PPO':  '#1f77b4',   # 蓝色
-    'A2C':  '#9467bd',   # 紫色
-    'SAC':  '#ff7f0e',   # 橙色
-    'TD3':  '#2ca02c',   # 绿色
-    'DDPG': '#d62728',   # 红色
+    'PPO':       '#1f77b4',   # 蓝色
+    'A2C':       '#9467bd',   # 紫色
+    'SAC':       '#ff7f0e',   # 橙色
+    'TD3':       '#2ca02c',   # 绿色
+    'DDPG':      '#d62728',   # 红色
+    'REINFORCE': '#8c564b',   # 棕色
+    'Random':    '#7f7f7f',   # 灰色
 }
+
+
+# ======================== 工具函数 ========================
+
+def set_seed(seed):
+    """设置随机种子以确保可复现性"""
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 # ======================== 训练函数 ========================
@@ -83,14 +101,42 @@ def train_on_policy(algo_name, agent, enable_i2s, num_episodes=NUM_EPISODES):
     return all_rewards, all_profits
 
 
+def train_baseline_random(algo_name, enable_i2s, num_episodes=NUM_EPISODES):
+    """运行 Random 基线 (无学习，仅随机采样)"""
+    env = HydrogenEnv(enable_i2s_constraint=enable_i2s)
+    agent = RandomBaseline(env.action_space)
+
+    all_rewards = []
+    all_profits = []
+
+    for ep in range(num_episodes):
+        state = env.reset()
+        ep_reward = 0
+        ep_profit = 0
+        done = False
+
+        while not done:
+            action = agent.select_action(state, evaluate=False)
+            next_state, reward, done, info = env.step(action)
+            state = next_state
+            ep_reward += reward
+            ep_profit += info.get('profit', 0.0)
+
+        all_rewards.append(ep_reward)
+        all_profits.append(ep_profit)
+
+        if (ep + 1) % 20 == 0:
+            print(f"    {algo_name:<5s} Episode {ep+1:>3d}/{num_episodes}, "
+                  f"Reward: {ep_reward:>8.2f}, Profit: {ep_profit:>10.2f}")
+
+    return all_rewards, all_profits
+
+
 def train_off_policy(algo_name, agent, enable_i2s, num_episodes=NUM_EPISODES,
                      warmup_steps=WARMUP_STEPS, batch_size=BATCH_SIZE):
     """训练 Off-Policy 算法 (SAC / TD3 / DDPG)"""
     env = HydrogenEnv(enable_i2s_constraint=enable_i2s)
-    if isinstance(agent, SAC) and agent.use_transformer:
-        replay_buffer = SequenceReplayBuffer(capacity=100000)
-    else:
-        replay_buffer = ReplayBuffer(capacity=100000)
+    replay_buffer = ReplayBuffer(capacity=100000)
 
     all_rewards = []
     all_profits = []
@@ -102,46 +148,22 @@ def train_off_policy(algo_name, agent, enable_i2s, num_episodes=NUM_EPISODES,
         ep_profit = 0
         done = False
 
-        if isinstance(agent, SAC) and agent.use_transformer:
-            agent.reset_state_buffer()
-            agent.append_state(state)
-
         while not done:
-            if isinstance(agent, SAC) and agent.use_transformer:
-                state_seq = agent.get_state_seq()
-                if total_steps < warmup_steps:
-                    action = env.action_space.sample()
-                else:
-                    action = agent.select_action_from_seq(state_seq, evaluate=False)
-
-                next_state, reward, done, info = env.step(action)
-                agent.append_state(next_state)
-                next_state_seq = agent.get_state_seq()
-                replay_buffer.push(state_seq, action, reward, next_state_seq, float(done))
-
-                if total_steps >= warmup_steps and len(replay_buffer) >= batch_size:
-                    agent.update(replay_buffer, batch_size)
-
-                state = next_state
-                ep_reward += reward
-                ep_profit += info.get('profit', 0.0)
-                total_steps += 1
+            if total_steps < warmup_steps:
+                action = env.action_space.sample()
             else:
-                if total_steps < warmup_steps:
-                    action = env.action_space.sample()
-                else:
-                    action = agent.select_action(state, evaluate=False)
+                action = agent.select_action(state, evaluate=False)
 
-                next_state, reward, done, info = env.step(action)
-                replay_buffer.push(state, action, reward, next_state, float(done))
+            next_state, reward, done, info = env.step(action)
+            replay_buffer.push(state, action, reward, next_state, float(done))
 
-                if total_steps >= warmup_steps and len(replay_buffer) >= batch_size:
-                    agent.update(replay_buffer, batch_size)
+            if total_steps >= warmup_steps and len(replay_buffer) >= batch_size:
+                agent.update(replay_buffer, batch_size)
 
-                state = next_state
-                ep_reward += reward
-                ep_profit += info.get('profit', 0.0)
-                total_steps += 1
+            state = next_state
+            ep_reward += reward
+            ep_profit += info.get('profit', 0.0)
+            total_steps += 1
 
         all_rewards.append(ep_reward)
         all_profits.append(ep_profit)
@@ -210,7 +232,7 @@ def plot_i2s_comparison(results_by_condition):
 
         ax.set_title(title, fontsize=10, fontweight='bold')
         ax.set_xlabel('Episode')
-        ax.legend(loc='best', ncol=2, frameon=False)
+        ax.legend(loc='best', ncol=3, frameon=False)
         ax.grid(True, alpha=0.3, linestyle='--')
     plt.show()
 
@@ -262,10 +284,9 @@ def print_summary(results_by_condition):
 
 def main():
     print("=" * 70)
-    print("  RL Algorithm Comparison: PPO vs A2C vs SAC vs TD3 vs DDPG")
+    print("  RL Algorithm Comparison: PPO vs A2C vs SAC vs TD3 vs DDPG vs REINFORCE vs Random")
     print("=" * 70)
-    print(f"  On-Policy:  PPO, A2C")
-    print(f"  Off-Policy: SAC, TD3, DDPG")
+    print(f"  Runs per Algorithm:     {NUM_RUNS} (取平均)")
     print(f"  Episodes per Algorithm: {NUM_EPISODES}")
     print(f"  Off-Policy Warmup:      {WARMUP_STEPS} steps")
     print(f"  Learning Rate:          {LR}")
@@ -288,49 +309,101 @@ def main():
         times = {}
 
         # --- 1. PPO (On-Policy) ---
-        print(f"\n[1/5] Training PPO ({NUM_EPISODES} episodes)...")
-        agent = PPO(state_dim, action_dim, lr=LR)
+        print(f"\n[1/7] Training PPO ({NUM_RUNS} runs × {NUM_EPISODES} episodes)...")
+        all_r, all_p = [], []
         t0 = time.time()
-        r, p = train_on_policy('PPO', agent, enable_i2s, NUM_EPISODES)
+        for run in range(NUM_RUNS):
+            set_seed(42 + run)
+            agent = PPO(state_dim, action_dim, lr=LR)
+            r, p = train_on_policy('PPO', agent, enable_i2s, NUM_EPISODES)
+            all_r.append(r)
+            all_p.append(p)
         times['PPO'] = time.time() - t0
-        results['PPO'] = (r, p)
-        print(f"  PPO  done in {times['PPO']:.1f}s, Final MA: {np.mean(r[-20:]):.2f}")
+        results['PPO'] = (np.mean(all_r, axis=0), np.mean(all_p, axis=0))
+        print(f"  PPO  done in {times['PPO']:.1f}s, Final MA: {np.mean(results['PPO'][0][-20:]):.2f}")
 
         # --- 2. A2C (On-Policy) ---
-        print(f"\n[2/5] Training A2C ({NUM_EPISODES} episodes)...")
-        agent = A2C(state_dim, action_dim, lr=LR)
+        print(f"\n[2/7] Training A2C ({NUM_RUNS} runs × {NUM_EPISODES} episodes)...")
+        all_r, all_p = [], []
         t0 = time.time()
-        r, p = train_on_policy('A2C', agent, enable_i2s, NUM_EPISODES)
+        for run in range(NUM_RUNS):
+            set_seed(42 + run)
+            agent = A2C(state_dim, action_dim, lr=LR)
+            r, p = train_on_policy('A2C', agent, enable_i2s, NUM_EPISODES)
+            all_r.append(r)
+            all_p.append(p)
         times['A2C'] = time.time() - t0
-        results['A2C'] = (r, p)
-        print(f"  A2C  done in {times['A2C']:.1f}s, Final MA: {np.mean(r[-20:]):.2f}")
+        results['A2C'] = (np.mean(all_r, axis=0), np.mean(all_p, axis=0))
+        print(f"  A2C  done in {times['A2C']:.1f}s, Final MA: {np.mean(results['A2C'][0][-20:]):.2f}")
 
         # --- 3. SAC (Off-Policy) ---
-        print(f"\n[3/5] Training SAC ({NUM_EPISODES} episodes)...")
-        agent = SAC(state_dim, action_dim, lr=LR)
+        print(f"\n[3/7] Training SAC ({NUM_RUNS} runs × {NUM_EPISODES} episodes)...")
+        all_r, all_p = [], []
         t0 = time.time()
-        r, p = train_off_policy('SAC', agent, enable_i2s, NUM_EPISODES)
+        for run in range(NUM_RUNS):
+            set_seed(42 + run)
+            agent = SAC(state_dim, action_dim, lr=LR)
+            r, p = train_off_policy('SAC', agent, enable_i2s, NUM_EPISODES)
+            all_r.append(r)
+            all_p.append(p)
         times['SAC'] = time.time() - t0
-        results['SAC'] = (r, p)
-        print(f"  SAC  done in {times['SAC']:.1f}s, Final MA: {np.mean(r[-20:]):.2f}")
+        results['SAC'] = (np.mean(all_r, axis=0), np.mean(all_p, axis=0))
+        print(f"  SAC  done in {times['SAC']:.1f}s, Final MA: {np.mean(results['SAC'][0][-20:]):.2f}")
 
         # --- 4. TD3 (Off-Policy) ---
-        print(f"\n[4/5] Training TD3 ({NUM_EPISODES} episodes)...")
-        agent = TD3(state_dim, action_dim, lr=LR)
+        print(f"\n[4/7] Training TD3 ({NUM_RUNS} runs × {NUM_EPISODES} episodes)...")
+        all_r, all_p = [], []
         t0 = time.time()
-        r, p = train_off_policy('TD3', agent, enable_i2s, NUM_EPISODES)
+        for run in range(NUM_RUNS):
+            set_seed(42 + run)
+            agent = TD3(state_dim, action_dim, lr=LR)
+            r, p = train_off_policy('TD3', agent, enable_i2s, NUM_EPISODES)
+            all_r.append(r)
+            all_p.append(p)
         times['TD3'] = time.time() - t0
-        results['TD3'] = (r, p)
-        print(f"  TD3  done in {times['TD3']:.1f}s, Final MA: {np.mean(r[-20:]):.2f}")
+        results['TD3'] = (np.mean(all_r, axis=0), np.mean(all_p, axis=0))
+        print(f"  TD3  done in {times['TD3']:.1f}s, Final MA: {np.mean(results['TD3'][0][-20:]):.2f}")
 
         # --- 5. DDPG (Off-Policy) ---
-        print(f"\n[5/5] Training DDPG ({NUM_EPISODES} episodes)...")
-        agent = DDPG(state_dim, action_dim, lr=LR)
+        print(f"\n[5/7] Training DDPG ({NUM_RUNS} runs × {NUM_EPISODES} episodes)...")
+        all_r, all_p = [], []
         t0 = time.time()
-        r, p = train_off_policy('DDPG', agent, enable_i2s, NUM_EPISODES)
+        for run in range(NUM_RUNS):
+            set_seed(42 + run)
+            agent = DDPG(state_dim, action_dim, lr=LR)
+            r, p = train_off_policy('DDPG', agent, enable_i2s, NUM_EPISODES)
+            all_r.append(r)
+            all_p.append(p)
         times['DDPG'] = time.time() - t0
-        results['DDPG'] = (r, p)
-        print(f"  DDPG done in {times['DDPG']:.1f}s, Final MA: {np.mean(r[-20:]):.2f}")
+        results['DDPG'] = (np.mean(all_r, axis=0), np.mean(all_p, axis=0))
+        print(f"  DDPG done in {times['DDPG']:.1f}s, Final MA: {np.mean(results['DDPG'][0][-20:]):.2f}")
+
+        # --- 6. REINFORCE (On-Policy Baseline) ---
+        print(f"\n[6/7] Training REINFORCE ({NUM_RUNS} runs × {NUM_EPISODES} episodes)...")
+        all_r, all_p = [], []
+        t0 = time.time()
+        for run in range(NUM_RUNS):
+            set_seed(42 + run)
+            agent = REINFORCE(state_dim, action_dim, lr=LR)
+            r, p = train_on_policy('REINFORCE', agent, enable_i2s, NUM_EPISODES)
+            all_r.append(r)
+            all_p.append(p)
+        times['REINFORCE'] = time.time() - t0
+        results['REINFORCE'] = (np.mean(all_r, axis=0), np.mean(all_p, axis=0))
+        print(f"  REINFORCE done in {times['REINFORCE']:.1f}s, Final MA: {np.mean(results['REINFORCE'][0][-20:]):.2f}")
+
+        # --- 7. Random (Baseline, 无训练) ---
+        print(f"\n[7/7] Running Random baseline ({NUM_RUNS} runs × {NUM_EPISODES} episodes)...")
+        all_r, all_p = [], []
+        t0 = time.time()
+        for run in range(NUM_RUNS):
+            set_seed(42 + run)
+            r, p = train_baseline_random('Random', enable_i2s, NUM_EPISODES)
+            all_r.append(r)
+            all_p.append(p)
+        times['Random'] = time.time() - t0
+        results['Random'] = (np.mean(all_r, axis=0), np.mean(all_p, axis=0))
+        print(f"  Random done in {times['Random']:.1f}s, Final MA: {np.mean(results['Random'][0][-20:]):.2f}")
 
         results_by_condition[enable_i2s] = results
 
