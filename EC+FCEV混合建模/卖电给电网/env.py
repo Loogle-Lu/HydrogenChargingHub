@@ -80,10 +80,12 @@ class HydrogenEnv(gym.Env):
         """
         t1_soc = self.storage.t1.get_soc()
         t2_soc = self.storage.t2.get_soc()
+        # 差压级联: T3₃(500bar) 是最高压储罐，C3 优先从中取气
         t3_avg_pressure = (self.storage.t3_1.max_pressure * self.storage.t3_1.get_soc() +
                            self.storage.t3_2.max_pressure * self.storage.t3_2.get_soc() +
                            self.storage.t3_3.max_pressure * self.storage.t3_3.get_soc()) / 3.0
-        t4_pressure = self.storage.t4.max_pressure * self.storage.t4.get_soc()
+        # C3 在线取气: 以 T3₃ (500 bar) 作为 C3 入口压力参考，无 T4
+        t3_3_pressure = self.storage.t3_3.max_pressure * self.storage.t3_3.get_soc()
         avg_fcev_sog = self.service_station.current_fcev_avg_sog
 
         c1_flow_base = h2_produced * min(1.0, max(0.5, t1_soc))
@@ -100,10 +102,12 @@ class HydrogenEnv(gym.Env):
             c2_flow, tank_pressure=t3_avg_pressure, electricity_price=price,
             cooling_intensity=cooling_intensity, bypass_bias=bypass_bias)
 
+        # C3: 差压在线直充 FCEV (取代 T4 缓冲罐)
+        # 流量随 FCEV 需求和差压可用量动态调整
         c3_flow_base = fcev_h2_demand * 0.3
         c3_flow = c3_flow_base * (0.6 + 0.4 * comp_load_ratio)
         c3_power, c3_heat = self.comp_system.compute_c3(
-            c3_flow, avg_fcev_sog=avg_fcev_sog, tank_pressure=t4_pressure,
+            c3_flow, avg_fcev_sog=avg_fcev_sog, tank_pressure=t3_3_pressure,
             electricity_price=price, bypass_bias=bypass_bias,
             c3_pressure_bias=c3_pressure_bias)
 
@@ -198,11 +202,23 @@ class HydrogenEnv(gym.Env):
         real_fc_h2_used = h2_needed_for_fc * supply_ratio
         fc_actual_power, _ = self.fc.compute(real_fc_h2_used)
 
-        # --- 11. 电网互动与财务 (无BESS: EV充电来自 绿色能源+电网+H2转电) ---
-        # 电力平衡: 供应 - 需求
-        # 供应: FC(H2转电) + 剩余可再生能源 | 需求: 制氢链(C1+C2+C3+Chiller) + EV充电
-        available_re_for_grid = re_gen - power_from_re  # 剩余可再生能源(电解槽优先用后)
-        net_power = (fc_actual_power + available_re_for_grid) - (total_load - ele_actual_power)
+        # --- 11. 电网互动与财务: EV优先使用氢转电，不足再购电 ---
+        # 供应: FC(H2转电) + 剩余可再生能源 | 需求: 制氢链 + EV充电
+        available_re_for_grid = re_gen - power_from_re
+        own_supply = fc_actual_power + available_re_for_grid  # 自有供电 (FC+RE)
+        load_non_ele = total_load - ele_actual_power  # 制氢链(除电解槽) + EV
+
+        # EV 供电优先级: 优先氢转电(FC)+绿电，不足部分从电网购电
+        # 氢转电利润 > 电网购电卖EV (边际: FC边际成本低 vs 电网=电价)，故优先用自有电
+        ev_from_fc_re = min(ev_power_demand, own_supply)
+        ev_from_grid = max(0.0, ev_power_demand - own_supply)
+        h2_load_from_own = min(h2_production_load, max(0, own_supply - ev_from_fc_re))
+        h2_load_from_grid = max(0.0, h2_production_load - h2_load_from_own)
+        grid_purchase_bus = ev_from_grid + h2_load_from_grid  # 母线侧购电
+        net_power = own_supply - load_non_ele  # 正=余电可售，负=需购电
+
+        # 电网成本: 电解槽购电 power_from_grid + 母线侧购电 (仅对实际购电量计费)
+        cost_grid = (power_from_grid * Config.dt + grid_purchase_bus * Config.dt) * price
 
         # 收入来源
         revenue_ev = ev_revenue  # EV充电收入
@@ -225,13 +241,6 @@ class HydrogenEnv(gym.Env):
             if 0.4 <= current_soc <= 0.6:
                 arbitrage_bonus += Config.soc_health_bonus
         
-        # 电力成本/收入计算
-        # 制氢生产链总负载
-        h2_production_load_total = ele_actual_power + c1_power + c2_power + c3_power + chiller_power
-        
-        # 制氢生产链的电力成本
-        cost_h2_production = h2_production_load_total * price * Config.dt
-        
         # 电网交互成本/收入 (v4.0: 支持 zero_export / local_grid 两种模式)
         revenue_grid_raw = 0
         if net_power > 0:
@@ -247,15 +256,24 @@ class HydrogenEnv(gym.Env):
         revenue_grid_cap = service_revenue * Config.max_grid_revenue_ratio
         revenue_grid = min(revenue_grid_raw, revenue_grid_cap)
         
-        # 统一使用 cost_grid 代表电网侧的总支出 (简化模型：全额设备耗电按网电价计成本)
-        cost_grid = cost_h2_production
-        
         # 惩罚
         penalty = service_penalty  # 未满足服务惩罚
         if shortage_h2 > 0: 
             penalty += shortage_h2 * Config.penalty_unmet_h2_demand
         if excess_h2 > 0: 
             penalty += excess_h2 * 10
+
+        # 压缩机效率激励: 奖励低于参考基准的单位氢气能耗
+        # 仅计入 Reward (训练信号), 不影响 Profit (真实经济指标)
+        comp_efficiency_bonus = 0.0
+        if Config.enable_comp_eff_bonus:
+            total_h2_compressed_step = (c1_flow + c2_flow + c3_flow) * Config.dt  # kg
+            total_comp_kw = c1_power + c2_power + c3_power
+            if total_h2_compressed_step > 0.01:
+                actual_kWh_per_kg = total_comp_kw * Config.dt / total_h2_compressed_step
+                energy_saved_per_kg = Config.comp_eff_ref_kWh_per_kg - actual_kWh_per_kg
+                comp_efficiency_bonus = (energy_saved_per_kg * total_h2_compressed_step
+                                         * Config.comp_eff_bonus_coef)
 
         # =========================================================================
         # [核心修正 v3.5] 区分 "真实利润(Profit)" 和 "强化学习奖励(Reward)"
@@ -265,9 +283,9 @@ class HydrogenEnv(gym.Env):
         #    Profit = EV收入 + FCEV收入 + 售电收入 - 电费成本
         step_profit = revenue_ev + revenue_fcev + revenue_grid - cost_grid
 
-        # 2. 强化学习奖励 (用于训练): 包含人工引导信号(arbitrage_bonus) 和 惩罚
-        #    Reward = Profit + 人工奖励 - 惩罚
-        step_reward = step_profit + arbitrage_bonus - penalty
+        # 2. 强化学习奖励 (用于训练): 包含人工引导信号(arbitrage_bonus, comp_efficiency_bonus) 和 惩罚
+        #    Reward = Profit + 套利奖励 + 压缩效率奖励 - 惩罚
+        step_reward = step_profit + arbitrage_bonus + comp_efficiency_bonus - penalty
         # =========================================================================
 
         self.current_step += 1
@@ -311,13 +329,16 @@ class HydrogenEnv(gym.Env):
             "load_power": total_load,
             "h2_production_load": h2_production_load,
             "ev_charging_load": ev_power_demand,
+            "ev_from_fc_re": ev_from_fc_re,  # EV优先氢转电: 来自FC+RE的供电 (kW)
+            "ev_from_grid": ev_from_grid,    # EV不足部分从电网购电 (kW)
             "total_load": total_load,
             "comp_power": c1_power + c2_power + c3_power,
             "comp_c1_power": c1_power,
             "comp_c2_power": c2_power,
             "comp_c3_power": c3_power,
             "chiller_power": chiller_power,
-            "tank_socs": self.storage.get_tank_socs(),
+            "bypass_activations": self.comp_system.bypass_activations.copy(),
+            "tank_socs": self.storage.get_tank_socs(),  # t1/t2/t3_1(200bar)/t3_2(350bar)/t3_3(500bar)
             # EV/FCEV统计
             "ev_served": station_stats['ev_served'],
             "fcev_served": station_stats['fcev_served'],
@@ -331,8 +352,9 @@ class HydrogenEnv(gym.Env):
             "power_from_re": power_from_re,
             "power_from_grid": power_from_grid,
             "ele_power": ele_actual_power,
-            # 储能套利统计
+            # 储能套利统计 & 压缩效率激励
             "arbitrage_bonus": arbitrage_bonus,
+            "comp_efficiency_bonus": comp_efficiency_bonus,
             "price": price,
             # 收益分解
             "revenue_ev": revenue_ev,

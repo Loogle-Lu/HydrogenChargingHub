@@ -225,10 +225,10 @@ class Compressor:
 
 class MultiStageCompressorSystem:
     """
-    多级级联压缩机系统 (根据HRS架构图)
-    C1: 2 bar -> 35 bar
-    C2: 35 bar -> 500 bar (级联充装)
-    C3: 500 bar -> 700 bar (LDFV快充)
+    差压级联压缩机系统 (本文创新架构)
+    C1: 2 bar  → 35 bar  (T1→T2)
+    C2: 35 bar → 500 bar (T2→T3₁/T3₂/T3₃ 差压充装)
+    C3: ≤500 bar → 700 bar (T3 在线取气直充 FCEV, 无 T4 缓冲)
     
     v3.1 新增功能:
     1. 智能旁路控制: 储罐压力充足时跳过压缩
@@ -369,11 +369,12 @@ class MultiStageCompressorSystem:
         v3.1: 支持旁路和自适应压力
         """
         if tank_pressures is None:
-            tank_pressures = {'t2': 0, 't3': 0, 't4': 0}
-        
+            # t3_3: T3₃(500 bar) — C3 在线取气入口（差压级联，无 T4）
+            tank_pressures = {'t2': 0, 't3': 0, 't3_3': 0}
+
         p1, h1 = self.compute_c1(flow_c1, tank_pressures.get('t2', 0), electricity_price)
         p2, h2 = self.compute_c2(flow_c2, tank_pressures.get('t3', 0), electricity_price)
-        p3, h3 = self.compute_c3(flow_c3, avg_fcev_sog, tank_pressures.get('t4', 0), electricity_price)
+        p3, h3 = self.compute_c3(flow_c3, avg_fcev_sog, tank_pressures.get('t3_3', 0), electricity_price)
         
         return (p1 + p2 + p3), (h1 + h2 + h3)
     
@@ -473,110 +474,138 @@ class HydrogenTank:
 
 class MultiTankStorage:
     """
-    多储罐系统 (根据HRS架构)
-    T1: 低压缓冲罐 (2 bar)
-    T2: 中压储罐 (35 bar)
-    T3_1, T3_2, T3_3: 级联高压储罐组 (500 bar)
-    T4: 超高压缓冲罐 (900 bar, for LDFV)
+    差压级联储罐系统 (Differential-Pressure Cascade, 本文创新架构)
+
+    拓扑:
+      T1 (2 bar)  → C1 → T2 (35 bar) → C2 → T3₁/T3₂/T3₃ (200/350/500 bar)
+                                              → C3 (在线直充) → FCEV
+
+    核心创新: T3 三罐采用差压分级 (200 / 350 / 500 bar)
+    - C2 充装时优先填充压力最低的储罐 (最大压差驱动，效率最优)
+    - C3 取气时优先从压力最高的 T3₃ (500 bar) 取气，减少压缩功
+    - APC 根据 FCEV SOG 动态选择取气压力层，实现精细化控制
+    - 去掉 T4 超高压缓冲罐，C3 在线压缩直接输出至 FCEV 加氢机
     """
     def __init__(self):
         self.t1 = HydrogenTank(
-            Config.t1_capacity_kg,
-            Config.t1_max_pressure,
-            Config.t1_initial_soc,
-            name="T1"
+            Config.t1_capacity_kg, Config.t1_max_pressure,
+            Config.t1_initial_soc, name="T1"
         )
         self.t2 = HydrogenTank(
-            Config.t2_capacity_kg,
-            Config.t2_max_pressure,
-            Config.t2_initial_soc,
-            name="T2"
+            Config.t2_capacity_kg, Config.t2_max_pressure,
+            Config.t2_initial_soc, name="T2"
         )
-        # T3级联系统
+        # 差压级联储罐组: T3₁ < T3₂ < T3₃
         self.t3_1 = HydrogenTank(
-            Config.t3_1_capacity_kg,
-            Config.t3_max_pressure,
-            Config.t3_initial_soc,
-            name="T3_1"
+            Config.t3_1_capacity_kg, Config.t3_1_max_pressure,
+            Config.t3_initial_soc, name="T3_1(200bar)"
         )
         self.t3_2 = HydrogenTank(
-            Config.t3_2_capacity_kg,
-            Config.t3_max_pressure,
-            Config.t3_initial_soc,
-            name="T3_2"
+            Config.t3_2_capacity_kg, Config.t3_2_max_pressure,
+            Config.t3_initial_soc, name="T3_2(350bar)"
         )
         self.t3_3 = HydrogenTank(
-            Config.t3_3_capacity_kg,
-            Config.t3_max_pressure,
-            Config.t3_initial_soc,
-            name="T3_3"
+            Config.t3_3_capacity_kg, Config.t3_3_max_pressure,
+            Config.t3_initial_soc, name="T3_3(500bar)"
         )
-        self.t4 = HydrogenTank(
-            Config.t4_capacity_kg,
-            Config.t4_max_pressure,
-            Config.t4_initial_soc,
-            name="T4"
-        )
-    
-    def step_all(self, h2_from_ele, h2_to_c1, h2_from_c1, h2_to_c2, 
+        # T4 已移除: C3 在线直充取代超高压缓冲罐
+
+    def _cascade_fill(self, h2_from_c2):
+        """
+        差压级联充装策略: C2 输出优先填充压力最低的储罐。
+        返回分配给各罐的流量 (kg/h)。
+        """
+        soc1 = self.t3_1.get_soc()
+        soc2 = self.t3_2.get_soc()
+        soc3 = self.t3_3.get_soc()
+
+        # 容量权重: SOC 越低，权重越大（优先补充压差最大的罐）
+        deficit1 = max(0.0, Config.storage_max_level - soc1)
+        deficit2 = max(0.0, Config.storage_max_level - soc2)
+        deficit3 = max(0.0, Config.storage_max_level - soc3)
+        total_deficit = deficit1 + deficit2 + deficit3
+
+        if total_deficit < 1e-6:
+            # 三罐均满，均匀分配（excess 会被罐体截断）
+            return h2_from_c2 / 3.0, h2_from_c2 / 3.0, h2_from_c2 / 3.0
+
+        f1 = h2_from_c2 * deficit1 / total_deficit
+        f2 = h2_from_c2 * deficit2 / total_deficit
+        f3 = h2_from_c2 * deficit3 / total_deficit
+        return f1, f2, f3
+
+    def _cascade_discharge(self, h2_demand_c3):
+        """
+        差压级联取气策略: C3 优先从压力最高的 T3₃ (500 bar) 取气；
+        T3₃ 不足时依次向 T3₂、T3₁ 取气。
+        返回各罐的取气量 (kg/h)。
+        """
+        available3 = (self.t3_3.level - self.t3_3.min_lvl) / Config.dt
+        available2 = (self.t3_2.level - self.t3_2.min_lvl) / Config.dt
+        available1 = (self.t3_1.level - self.t3_1.min_lvl) / Config.dt
+
+        take3 = min(h2_demand_c3, max(0.0, available3))
+        remain = h2_demand_c3 - take3
+        take2 = min(remain, max(0.0, available2))
+        remain -= take2
+        take1 = min(remain, max(0.0, available1))
+        return take1, take2, take3
+
+    def step_all(self, h2_from_ele, h2_to_c1, h2_from_c1, h2_to_c2,
                  h2_from_c2, h2_demand, h2_to_c3, h2_from_c3):
         """
-        更新所有储罐状态
-        简化的物质流动:
-        - T1: 接收电解槽产氢, 输出到C1
-        - T2: 接收C1输出, 输出到C2
-        - T3系统: 接收C2输出(级联充装), 输出到需求和C3
-        - T4: 接收C3输出, 输出到LDFV快充需求
+        更新所有储罐状态。
+        H₂ 流动:
+          T1 ← Electrolyzer;  T1 → C1
+          T2 ← C1;            T2 → C2
+          T3₁/T3₂/T3₃ ← C2 (差压填充)
+          T3₁/T3₂/T3₃ → FCEV直接出罐 (h2_demand) + C3取气 (h2_to_c3, 差压优先)
+          C3 直充 FCEV (无 T4)
         """
-        # T1步进
+        # T1 / T2
         soc_t1, excess_t1, short_t1 = self.t1.step(h2_from_ele, h2_to_c1)
-        
-        # T2步进
         soc_t2, excess_t2, short_t2 = self.t2.step(h2_from_c1, h2_to_c2)
-        
-        # T3级联系统 - 均匀分配充装
-        h2_to_t3_each = h2_from_c2 / 3.0
-        soc_t3_1, excess_t3_1, short_t3_1 = self.t3_1.step(h2_to_t3_each, h2_demand/3.0 + h2_to_c3/3.0)
-        soc_t3_2, excess_t3_2, short_t3_2 = self.t3_2.step(h2_to_t3_each, h2_demand/3.0 + h2_to_c3/3.0)
-        soc_t3_3, excess_t3_3, short_t3_3 = self.t3_3.step(h2_to_t3_each, h2_demand/3.0 + h2_to_c3/3.0)
-        
-        # T4步进 (接收C3输出，供应高压需求)
-        soc_t4, excess_t4, short_t4 = self.t4.step(h2_from_c3, 0)
-        
-        # 汇总
-        total_excess = excess_t1 + excess_t2 + excess_t3_1 + excess_t3_2 + excess_t3_3 + excess_t4
-        total_shortage = short_t1 + short_t2 + short_t3_1 + short_t3_2 + short_t3_3 + short_t4
-        
-        # 计算总体SOC (加权平均)
-        total_capacity = (self.t1.capacity + self.t2.capacity + 
-                         self.t3_1.capacity + self.t3_2.capacity + self.t3_3.capacity +
-                         self.t4.capacity)
+
+        # C2 差压充装分配
+        fill1, fill2, fill3 = self._cascade_fill(h2_from_c2)
+
+        # C3 差压取气分配 (FCEV 直充流量)
+        take1_c3, take2_c3, take3_c3 = self._cascade_discharge(h2_to_c3)
+
+        # FCEV 低压直出 (h2_demand 从各罐均匀取气)
+        direct1 = h2_demand / 3.0
+        direct2 = h2_demand / 3.0
+        direct3 = h2_demand / 3.0
+
+        soc_t3_1, ex1, sh1 = self.t3_1.step(fill1, direct1 + take1_c3)
+        soc_t3_2, ex2, sh2 = self.t3_2.step(fill2, direct2 + take2_c3)
+        soc_t3_3, ex3, sh3 = self.t3_3.step(fill3, direct3 + take3_c3)
+
+        total_excess = excess_t1 + excess_t2 + ex1 + ex2 + ex3
+        total_shortage = short_t1 + short_t2 + sh1 + sh2 + sh3
+
+        total_capacity = (self.t1.capacity + self.t2.capacity +
+                          self.t3_1.capacity + self.t3_2.capacity + self.t3_3.capacity)
         total_mass = (self.t1.level + self.t2.level +
-                     self.t3_1.level + self.t3_2.level + self.t3_3.level +
-                     self.t4.level)
+                      self.t3_1.level + self.t3_2.level + self.t3_3.level)
         overall_soc = total_mass / total_capacity
-        
+
         return overall_soc, total_excess, total_shortage
-    
+
     def get_total_soc(self):
-        """获取系统总SOC"""
-        total_capacity = (self.t1.capacity + self.t2.capacity + 
-                         self.t3_1.capacity + self.t3_2.capacity + self.t3_3.capacity +
-                         self.t4.capacity)
+        total_capacity = (self.t1.capacity + self.t2.capacity +
+                          self.t3_1.capacity + self.t3_2.capacity + self.t3_3.capacity)
         total_mass = (self.t1.level + self.t2.level +
-                     self.t3_1.level + self.t3_2.level + self.t3_3.level +
-                     self.t4.level)
+                      self.t3_1.level + self.t3_2.level + self.t3_3.level)
         return total_mass / total_capacity
-    
+
     def get_tank_socs(self):
-        """获取所有储罐的SOC"""
         return {
-            't1': self.t1.get_soc(),
-            't2': self.t2.get_soc(),
-            't3_1': self.t3_1.get_soc(),
-            't3_2': self.t3_2.get_soc(),
-            't3_3': self.t3_3.get_soc(),
-            't4': self.t4.get_soc()
+            't1':   self.t1.get_soc(),
+            't2':   self.t2.get_soc(),
+            't3_1': self.t3_1.get_soc(),  # 200 bar
+            't3_2': self.t3_2.get_soc(),  # 350 bar
+            't3_3': self.t3_3.get_soc(),  # 500 bar
         }
 
 

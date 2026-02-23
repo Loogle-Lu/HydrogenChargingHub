@@ -28,7 +28,7 @@ from SAC import SAC, ReplayBuffer
 
 
 # ======================== 配置 ========================
-NUM_RUNS = 1
+NUM_RUNS = 3
 NUM_EPISODES = 80
 WARMUP_STEPS = 400
 BATCH_SIZE = 256
@@ -122,7 +122,7 @@ class NaiveArchEnv(HydrogenEnv):
             # 两级: C1(2→35) + C2_combined(35→700)
             # T_in 对 C2 假设理想回温（固定 T_in），但无动态控制
             p1, h1 = self._isentropic_kw(c1_flow, 2.0, 35.0)
-            # 第二级处理 c2_flow（需要从 35 bar 升压到 700 bar 直接送 FCEV/T4）
+            # 第二级处理 c2_flow（需要从 35 bar 升压到 700 bar 直接送 FCEV）
             p2, h2 = self._isentropic_kw(c2_flow, 35.0, 700.0)
             return p1, p2, 0.0,  h1, h2, 0.0,  c1_flow, c2_flow, c3_flow
 
@@ -313,7 +313,6 @@ def main():
     axs[1, 1].legend(loc="lower right", fontsize=8)
     axs[1, 1].grid(True, alpha=0.3, linestyle="--")
 
-    plt.savefig("CompressorComparison_exp3_cascade_ablation.png", dpi=150, bbox_inches="tight")
     plt.show()
     print("\nFigure saved: CompressorComparison_exp3_cascade_ablation.png")
 

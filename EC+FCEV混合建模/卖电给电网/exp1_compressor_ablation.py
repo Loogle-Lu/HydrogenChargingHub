@@ -21,13 +21,13 @@ from SAC import SAC, ReplayBuffer
 from config import Config
 
 
-# ======================== 配置 ========================
+# ======================== 配置 (与 compare.py 中 SAC 一致) ========================
 NUM_RUNS = 3             # 每种配置重复运行次数，取平均
-NUM_EPISODES = 80        # 每种配置训练 Episode 数
-WARMUP_STEPS = 400
-BATCH_SIZE = 256
-LR = 3e-4
-MA_WINDOW = 15
+NUM_EPISODES = 100       # 与 compare.py 一致
+WARMUP_STEPS = 500       # Off-Policy warmup，与 compare.py 一致
+BATCH_SIZE = 256         # 与 compare.py 一致
+LR = 3e-4                # 与 compare.py 一致
+MA_WINDOW = 20           # 与 compare.py 一致
 
 # 消融配置: (名称, enable_vsd, enable_dynamic_cooling, enable_bypass, enable_adaptive_pressure)
 ABLATION_VARIANTS = [

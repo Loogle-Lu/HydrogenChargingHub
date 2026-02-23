@@ -57,17 +57,17 @@ class Config:
     max_intercool_temp = 313.15  # K (40°C) 轻度冷却
     cooling_price_threshold = 0.10  # $/kWh 高于此电价则轻度冷却
     
-    # v3.1: 压力自适应控制 (Adaptive Pressure)
-    enable_adaptive_pressure = True  # 启用自适应压力
-    # 根据FCEV SOG分段充装压力目标
+    # v3.1: 压力自适应控制 (Adaptive Pressure, APC)
+    # 差压级联架构: APC 选择从哪一级 T3 取气，匹配 FCEV SOG
+    enable_adaptive_pressure = True
     adaptive_pressure_map = {
-        0.0: 700,   # SOG 0-30%: 700bar快速充装
+        0.0: 700,   # SOG 0-30%: 700 bar 快速充装 (从 T3₃ 500bar 经 C3 升压)
         0.3: 700,
-        0.4: 500,   # SOG 30-60%: 500bar中速充装
+        0.4: 500,   # SOG 30-60%: 直接用 T3₃ 500bar 输出
         0.6: 500,
-        0.7: 350,   # SOG 60-80%: 350bar慢速充装
+        0.7: 350,   # SOG 60-80%: 降至 T3₂ 350bar 节省压缩功
         0.8: 350,
-        0.9: 200    # SOG 80%+: 200bar涓流充电
+        0.9: 200    # SOG 80%+: 仅需 T3₁ 200bar 涓流充电
     }
     
     # C1: 第一级压缩机 (Electrolyzer output -> T2)
@@ -80,9 +80,10 @@ class Config:
     c2_output_pressure = 500.0  # bar (填充T3₁, T3₂, T3₃)
     c2_max_flow = 20.0  # kg/h
     
-    # C3: 第三级压缩机 (T3/T4 -> D2 for LDFV)
-    c3_input_pressure = 500.0  # bar
-    c3_output_pressure = 700.0  # bar (LDFV充装压力) - 可动态调整
+    # C3: 第三级压缩机 (T3 差压级联 -> FCEV 直充, 无 T4 缓冲罐)
+    # 从 T3 组最高压储罐取气，在线压缩后直接送 FCEV 加氢机
+    c3_input_pressure = 500.0  # bar (T3₃最高压)
+    c3_output_pressure = 700.0  # bar (FCEV 目标压力)
     c3_max_flow = 15.0  # kg/h
 
     # 3. 多储罐系统 (Multi-Tank Storage System)
@@ -96,17 +97,17 @@ class Config:
     t2_max_pressure = 35.0  # barg
     t2_initial_soc = 0.5
     
-    # T3: 高压级联储罐组 (Cascaded high-pressure tanks)
-    t3_1_capacity_kg = 150.0  # kg
-    t3_2_capacity_kg = 150.0  # kg
-    t3_3_capacity_kg = 150.0  # kg
-    t3_max_pressure = 500.0  # barg
+    # T3: 差压级联储罐组 (Differential-Pressure Cascade)
+    # T3₁(低压)→T3₂(中压)→T3₃(高压) 依次向 FCEV 充装，压差驱动
+    t3_1_capacity_kg = 120.0  # kg
+    t3_2_capacity_kg = 120.0  # kg
+    t3_3_capacity_kg = 120.0  # kg
+    t3_1_max_pressure = 200.0  # barg (低压，FCEV 高 SOG 阶段使用)
+    t3_2_max_pressure = 350.0  # barg (中压)
+    t3_3_max_pressure = 500.0  # barg (高压，FCEV 低 SOG 阶段优先)
     t3_initial_soc = 0.5
     
-    # T4: 超高压缓冲罐 (Buffer for 7kg LDFV fast service)
-    t4_capacity_kg = 16.0  # kg (for 7kg LDFV service)
-    t4_max_pressure = 900.0  # barg
-    t4_initial_soc = 0.5
+    # T4: 已移除 (C3 直充取代 T4 缓冲罐，简化拓扑，在线压缩)
     
     # 储罐通用参数
     storage_min_level = 0.05
@@ -145,8 +146,8 @@ class Config:
     fcev_sog_arrival_std = 0.10
     fcev_sog_target = 0.95  # 目标充装到95%
     
-    # 加氢服务价格
-    fcev_service_price = 12.0  # $/kg (略高于生产成本)
+    # 加氢服务价格 (卖氢收益 >> 卖电给电网，引导智能体优先满足FCEV)
+    fcev_service_price = 18.0  # $/kg (远高于制氢成本，卖氢为主要利润源)
     
     # 7. EV充电需求参数
     # 典型EV规格 (20% SOC初始 -> 80% SOC快充策略)
@@ -168,8 +169,10 @@ class Config:
     ev_soc_target_fast = 0.80  # 快充目标80% (保护电池)
     ev_soc_target_slow = 0.95  # 慢充目标95%
     
-    # EV充电服务价格
-    ev_service_price = 0.35  # $/kWh (含服务费)
+    # EV充电服务价格 (需保证 氢转电利润 > 电网购电卖EV 才有意义)
+    # 氢转电: 1 kg H2→16 kWh, 成本≈制氢电费; 电网: 购价=电价
+    # 合理区间: 0.35~0.45 $/kWh
+    ev_service_price = 0.40  # $/kWh (含服务费，略高以体现氢转电优势)
     
     # 8. 混合需求场景参数 (EV + FCEV)
     # 车辆到达率模型
@@ -216,8 +219,8 @@ class Config:
     max_concurrent_ev_fast = 4  # 快充桩数量
     max_concurrent_ev_slow = 8  # 慢充桩数量
     
-    # 11. 经济参数
-    hydrogen_price = 10.0  # $/kg (生产成本)
+    # 11. 经济参数 (卖氢 >> 卖电，EV优先氢转电，氢转电利润 > 电网购电卖EV)
+    hydrogen_price = 10.0  # $/kg (制氢成本参考)
     electricity_price_sell_coef = 1.0
     
     # --- v4.0: 电网售电模式 (卖电给地电网) ---
@@ -225,10 +228,9 @@ class Config:
     #   - zero_export: 多余电弃电，不产生收益
     #   - local_grid: 多余电可卖给地方电网，收购价低于零售价
     grid_export_mode = "local_grid"
-    local_grid_feedin_ratio = 0.6  # 地电网收购价 = 零售价 × 此系数 (通常0.5~0.7)
+    local_grid_feedin_ratio = 0.42  # 地电网收购价低，卖氢收益 >> 卖电收益
     # 防"只卖电不卖氢"策略漏洞: 售电收入计入Profit的上限 = 服务收入(EV+FCEV) × 此比例
-    # 确保IES必须从卖电和卖氢双重获利，不能仅靠卖电刷高Profit
-    max_grid_revenue_ratio = 0.5  # 售电收入不超过服务收入的50%计入
+    max_grid_revenue_ratio = 0.35  # 售电收入不超过服务收入的35%，强化卖氢主导
     
     # 储能套利激励参数 (新增)
     enable_arbitrage_bonus = True  # 启用储能套利奖励
@@ -271,3 +273,11 @@ class Config:
     # - 电池: 短时调峰 (秒-分钟)，高效率，快响应
     # - 氢气: 长时储能 (小时-天)，大容量，低效率
     # - 协同: 电池削峰填谷，氢气季节调节
+
+    # 13. 压缩机效率激励 (Compressor Efficiency Bonus)
+    # 显式奖励 RL Agent 降低单位氢气压缩能耗，使 7D 动作空间中的压缩机控制维度有更强的梯度信号
+    # 参考值: Naive Max Power [1.0, 0.0, 0.0] 约等效于 3.0 kWh/kg
+    # 当 actual_kWh_per_kg < comp_eff_ref_kWh_per_kg 时触发正向奖励
+    enable_comp_eff_bonus = True   # True=开启压缩效率激励 (推荐 exp2 开启)
+    comp_eff_ref_kWh_per_kg = 3.0  # 参考基准能耗 (kWh/kg H2); Naive 基线约在此值附近
+    comp_eff_bonus_coef = 30.0     # 激励系数: saving 1 kWh/kg × 0.1 kg H2 → +3 reward units
