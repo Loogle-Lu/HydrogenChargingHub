@@ -58,16 +58,15 @@ class Config:
     cooling_price_threshold = 0.10  # $/kWh 高于此电价则轻度冷却
     
     # v3.1: 压力自适应控制 (Adaptive Pressure, APC)
-    # 差压级联架构: APC 选择从哪一级 T3 取气，匹配 FCEV SOG
+    # C3 输入始终为 T3₃ (500 bar)，因此 APC 输出必须 ≥ 500 bar
+    # 高 SOG 时适当降低 C3 出口压力以节省压缩功
     enable_adaptive_pressure = True
     adaptive_pressure_map = {
-        0.0: 700,   # SOG 0-30%: 700 bar 快速充装 (从 T3₃ 500bar 经 C3 升压)
-        0.3: 700,
-        0.4: 500,   # SOG 30-60%: 直接用 T3₃ 500bar 输出
-        0.6: 500,
-        0.7: 350,   # SOG 60-80%: 降至 T3₂ 350bar 节省压缩功
-        0.8: 350,
-        0.9: 200    # SOG 80%+: 仅需 T3₁ 200bar 涓流充电
+        0.0: 700,   # SOG 0-70%: 700 bar 快速充装
+        0.7: 700,
+        0.8: 600,   # SOG 70-80%: 600 bar 减少过压缩
+        0.9: 550,   # SOG 80-90%: 550 bar
+        1.0: 500    # SOG 90%+:  500 bar 近似直出 T3₃
     }
     
     # C1: 第一级压缩机 (Electrolyzer output -> T2)
@@ -147,7 +146,9 @@ class Config:
     fcev_sog_target = 0.95  # 目标充装到95%
     
     # 加氢服务价格 (卖氢收益 >> 卖电给电网，引导智能体优先满足FCEV)
-    fcev_service_price = 18.0  # $/kg (远高于制氢成本，卖氢为主要利润源)
+    fcev_service_price = 18.0       # $/kg 700-bar 乘用车 (高压快充溢价)
+    fcev_350bar_ratio = 0.3         # 30% FCEV 为 350-bar 车型 (公交/卡车)
+    fcev_350bar_service_price = 12.0  # $/kg 350-bar 车型服务价格
     
     # 7. EV充电需求参数
     # 典型EV规格 (20% SOC初始 -> 80% SOC快充策略)
@@ -241,9 +242,14 @@ class Config:
     price_threshold_high = 0.10  # $/kWh (高电价阈值，高于此值鼓励放电)
     
     # 惩罚参数
-    penalty_unmet_h2_demand = 500.0  # $/kg 缺氢惩罚
-    penalty_unmet_ev_demand = 150.0  # $/vehicle 无法服务EV惩罚
-    penalty_vehicle_waiting = 30.0  # $/vehicle/hour 等待时间惩罚
+    penalty_unmet_h2_demand = 500.0   # $/kg 缺氢惩罚 (>> fcev_service_price=18, 强制优先供氢)
+    penalty_unmet_ev_demand = 150.0   # $/vehicle 无法服务EV惩罚
+    penalty_vehicle_waiting = 30.0    # $/vehicle/hour 等待时间惩罚
+    penalty_fcev_wait = 5.0           # $/vehicle/step 加氢队列等待惩罚 (促使agent预备足够T3氢气)
+
+    # State 归一化常量
+    price_max = 0.20   # $/kWh 电价归一化上限 (数据典型峰值约0.15, 留裕量)
+    queue_max = 5.0    # 辆 FCEV 队列归一化上限 (每种车型)
     
     # 12. 电池储能系统 (Battery Energy Storage System, BESS) - v2.6新增
     # 核心参数

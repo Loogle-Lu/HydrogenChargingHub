@@ -96,21 +96,19 @@ class NaiveArchEnv(HydrogenEnv):
         heat_kw = power_kw * (1.0 / self._eta - 1.0)
         return power_kw, heat_kw
 
-    def _compute_comp_block(self, h2_produced, fcev_h2_demand,
-                             comp_load_ratio, cooling_intensity,
-                             bypass_bias, c3_pressure_bias, price):
-        """覆写：朴素架构功耗计算（物理 H₂ 流量与父类相同，仅功耗不同）。"""
+    def _compute_comp_block(self, h2_produced, fcev_h2_demand_700,
+                             c1_load, c2_load, bypass_bias, c3_pressure_bias, price):
+        """覆写：朴素架构功耗计算（物理 H₂ 流量与父类相同，仅功耗不同）。
+        签名与父类 HydrogenEnv._compute_comp_block 一致 (v4.3 State 11D, Action 6D)。
+        """
         t1_soc = self.storage.t1.get_soc()
         t2_soc = self.storage.t2.get_soc()
-        avg_fcev_sog = self.service_station.current_fcev_avg_sog  # noqa: F841
-
-        # ---- 流量计算（与 smart 相同，物理上不变） ----
-        c1_flow_base = h2_produced * min(1.0, max(0.5, t1_soc))
-        comp_scale   = 0.4 + 0.6 * comp_load_ratio
-        c1_flow      = c1_flow_base * comp_scale
-        c2_flow_base = c1_flow_base * min(1.0, max(0.4, t2_soc)) + fcev_h2_demand * 0.5
-        c2_flow      = c2_flow_base * comp_scale
-        c3_flow      = fcev_h2_demand * 0.3 * (0.6 + 0.4 * comp_load_ratio)
+        # 流量计算：与父类结构一致，comp_scale 取 c1/c2 平均 (Naive 不区分)
+        comp_scale = 0.4 + 0.6 * ((c1_load + c2_load) / 2.0)
+        c1_flow = h2_produced * min(1.0, max(0.5, t1_soc)) * comp_scale
+        c2_flow_base = c1_flow * min(1.0, max(0.4, t2_soc))
+        c2_flow = c2_flow_base * comp_scale
+        c3_flow = min(fcev_h2_demand_700, Config.c3_max_flow)  # 与父类一致，需求驱动
 
         if self.arch == "naive_1stage":
             # 所有 H₂ 从 2 bar 直压到 700 bar，压比 = 350，热力学代价极大

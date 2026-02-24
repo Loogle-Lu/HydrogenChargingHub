@@ -482,7 +482,8 @@ class MultiTankStorage:
 
     核心创新: T3 三罐采用差压分级 (200 / 350 / 500 bar)
     - C2 充装时优先填充压力最低的储罐 (最大压差驱动，效率最优)
-    - C3 取气时优先从压力最高的 T3₃ (500 bar) 取气，减少压缩功
+    - 350-bar 车取气: T3₂(350 bar) 优先，T3₁(200 bar) 补充（高压快充后涓流）
+    - 700-bar 车取气: T3₃→T3₂→T3₁ 级联供 C3，高压优先减少压缩功，SOC 升高后逐级用 T3₂/T3₁
     - APC 根据 FCEV SOG 动态选择取气压力层，实现精细化控制
     - 去掉 T4 超高压缓冲罐，C3 在线压缩直接输出至 FCEV 加氢机
     """
@@ -534,52 +535,67 @@ class MultiTankStorage:
         f3 = h2_from_c2 * deficit3 / total_deficit
         return f1, f2, f3
 
-    def _cascade_discharge(self, h2_demand_c3):
+    def _cascade_discharge_350(self, h2_demand_350):
         """
-        差压级联取气策略: C3 优先从压力最高的 T3₃ (500 bar) 取气；
-        T3₃ 不足时依次向 T3₂、T3₁ 取气。
-        返回各罐的取气量 (kg/h)。
+        350-bar 车型取气: T3₂(350 bar) 优先，快满时用 T3₁(200 bar) 涓流。
+        高压优先，压差足够时快充；后期降压保护储罐。
+        返回 (take_t3_1, take_t3_2) kg/h。
         """
-        available3 = (self.t3_3.level - self.t3_3.min_lvl) / Config.dt
-        available2 = (self.t3_2.level - self.t3_2.min_lvl) / Config.dt
-        available1 = (self.t3_1.level - self.t3_1.min_lvl) / Config.dt
+        avail2 = max(0.0, (self.t3_2.level - self.t3_2.min_lvl) / Config.dt)
+        take2 = min(h2_demand_350, avail2)
+        remain = h2_demand_350 - take2
+        avail1 = max(0.0, (self.t3_1.level - self.t3_1.min_lvl) / Config.dt)
+        take1 = min(remain, avail1)
+        return take1, take2
 
-        take3 = min(h2_demand_c3, max(0.0, available3))
-        remain = h2_demand_c3 - take3
-        take2 = min(remain, max(0.0, available2))
-        remain -= take2
-        take1 = min(remain, max(0.0, available1))
+    def _cascade_discharge_c3(self, h2_demand_700):
+        """
+        700-bar 车型取气（供 C3）: T3₃(500 bar)→T3₂(350 bar)→T3₁(200 bar) 级联。
+        高压优先（T3₃）减少压缩功；SOC 升高后逐步用 T3₂、T3₁，符合 SAE J2601 快充后段降压。
+        返回 (take_t3_1, take_t3_2, take_t3_3) kg/h。
+        """
+        avail3 = max(0.0, (self.t3_3.level - self.t3_3.min_lvl) / Config.dt)
+        take3 = min(h2_demand_700, avail3)
+        remain = h2_demand_700 - take3
+        avail2 = max(0.0, (self.t3_2.level - self.t3_2.min_lvl) / Config.dt)
+        take2 = min(remain, avail2)
+        remain = remain - take2
+        avail1 = max(0.0, (self.t3_1.level - self.t3_1.min_lvl) / Config.dt)
+        take1 = min(remain, avail1)
         return take1, take2, take3
 
     def step_all(self, h2_from_ele, h2_to_c1, h2_from_c1, h2_to_c2,
-                 h2_from_c2, h2_demand, h2_to_c3, h2_from_c3):
+                 h2_from_c2, h2_demand_350, h2_for_fc, h2_to_c3, h2_from_c3):
         """
         更新所有储罐状态。
-        H₂ 流动:
-          T1 ← Electrolyzer;  T1 → C1
-          T2 ← C1;            T2 → C2
-          T3₁/T3₂/T3₃ ← C2 (差压填充)
-          T3₁/T3₂/T3₃ → FCEV直接出罐 (h2_demand) + C3取气 (h2_to_c3, 差压优先)
-          C3 直充 FCEV (无 T4)
+
+        H₂ 流动规则:
+          T1  ← Electrolyzer;  T1 → C1
+          T2  ← C1;            T2 → C2
+          T3₁ ← C2(差压充装);  T3₁ → FuelCell + 350-bar(补充) + C3(级联末段)
+          T3₂ ← C2(差压充装);  T3₂ → 350-bar(优先) + C3(级联中段)
+          T3₃ ← C2(差压充装);  T3₃ → C3 输入(级联首段, 700-bar 车)
+          C3  : T3₃→T3₂→T3₁ 级联取气→700 bar → 700-bar FCEV
         """
         # T1 / T2
         soc_t1, excess_t1, short_t1 = self.t1.step(h2_from_ele, h2_to_c1)
         soc_t2, excess_t2, short_t2 = self.t2.step(h2_from_c1, h2_to_c2)
 
-        # C2 差压充装分配
+        # C2 差压充装分配 (仍按 deficit 权重)
         fill1, fill2, fill3 = self._cascade_fill(h2_from_c2)
 
-        # C3 差压取气分配 (FCEV 直充流量)
-        take1_c3, take2_c3, take3_c3 = self._cascade_discharge(h2_to_c3)
+        # 350-bar 车取气: T3₂ 优先 → T3₁
+        take_350_t1, take_350_t2 = self._cascade_discharge_350(h2_demand_350)
 
-        # FCEV 低压直出 (h2_demand 从各罐均匀取气)
-        direct1 = h2_demand / 3.0
-        direct2 = h2_demand / 3.0
-        direct3 = h2_demand / 3.0
+        # 700-bar 车取气（C3）: T3₃ → T3₂ → T3₁ 级联
+        take_c3_t1, take_c3_t2, take_c3_t3 = self._cascade_discharge_c3(h2_to_c3)
 
-        soc_t3_1, ex1, sh1 = self.t3_1.step(fill1, direct1 + take1_c3)
-        soc_t3_2, ex2, sh2 = self.t3_2.step(fill2, direct2 + take2_c3)
-        soc_t3_3, ex3, sh3 = self.t3_3.step(fill3, direct3 + take3_c3)
+        # T3₁: FC + 350-bar(补充) + C3(级联末段)
+        soc_t3_1, ex1, sh1 = self.t3_1.step(fill1, h2_for_fc + take_350_t1 + take_c3_t1)
+        # T3₂: 350-bar(优先) + C3(级联中段)
+        soc_t3_2, ex2, sh2 = self.t3_2.step(fill2, take_350_t2 + take_c3_t2)
+        # T3₃: C3(级联首段)
+        soc_t3_3, ex3, sh3 = self.t3_3.step(fill3, take_c3_t3)
 
         total_excess = excess_t1 + excess_t2 + ex1 + ex2 + ex3
         total_shortage = short_t1 + short_t2 + sh1 + sh2 + sh3
@@ -802,12 +818,15 @@ class FCEVehicle(Vehicle):
     """
     燃料电池车 (Fuel Cell Electric Vehicle)
     基于SAE J2601协议，快速加氢（3-5分钟）
+    target_pressure: 350 bar (公交/卡车) 或 700 bar (乘用车)
     """
-    def __init__(self, vehicle_id, arrival_time, tank_capacity, sog_initial, sog_target):
+    def __init__(self, vehicle_id, arrival_time, tank_capacity, sog_initial, sog_target,
+                 target_pressure=700):
         super().__init__(vehicle_id, arrival_time, 'FCEV')
         self.tank_capacity = tank_capacity  # kg H2
         self.sog_initial = sog_initial  # State of Gas (0-1)
         self.sog_target = sog_target
+        self.target_pressure = target_pressure  # 350 or 700 bar
         
         # 计算所需氢气量
         self.h2_needed = (sog_target - sog_initial) * tank_capacity  # kg
@@ -836,8 +855,10 @@ class FCEVehicle(Vehicle):
         return False
     
     def get_refueling_revenue(self):
-        """计算加氢收入"""
-        return self.h2_needed * Config.fcev_service_price
+        """计算加氢收入 (按目标压力区分单价)"""
+        price = (Config.fcev_350bar_service_price if self.target_pressure == 350
+                 else Config.fcev_service_price)
+        return self.h2_needed * price
 
 
 class FCEVDemandGenerator:
@@ -949,122 +970,134 @@ class FCEVDemandGenerator:
         else:
             sog_target = Config.fcev_sog_target  # 乘用车95%
         
+        # 350-bar 车型比例 (公交/卡车)
+        target_pressure = 350 if np.random.random() < Config.fcev_350bar_ratio else 700
+        
         return FCEVehicle(
             vehicle_id, arrival_time, tank_capacity,
-            sog_initial, sog_target
+            sog_initial, sog_target, target_pressure
         )
 
 
 class FCEVServiceStation:
     """
-    FCEV加氢服务站 (已移除EV充电)
-    管理FCEV队列、加氢调度和需求响应
-    
-    v3.1: FCEV平均SOG追踪，用于自适应压力控制
+    FCEV加氢服务站
+    - 350-bar 车型: T3₂→T3₁ 级联供气 (T3₂ 优先, T3₁ 补充, 无需 C3)
+    - 700-bar 车型: T3₃→T3₂→T3₁ 级联经 C3→700 bar 在线压缩
+    - 分别追踪两类需求量，APC 只感知 700-bar 车的 SOG
     """
     def __init__(self):
-        # FCEV加氢设施
         self.fcev_dispensers = Config.max_concurrent_fcev
         
-        # 队列
+        # 统一队列，按 target_pressure 区分处理
         self.fcev_queue = []
         self.fcev_being_served = []
         
-        # 统计
         self.total_fcev_served = 0
         self.total_fcev_revenue = 0.0
         self.total_vehicles_delayed = 0
         
-        # v3.1: FCEV SOG追踪
-        self.current_fcev_avg_sog = 0.5
+        # APC 只用 700-bar 车的平均 SOG
+        self.current_fcev_700_avg_sog = 0.5
     
     def add_vehicles(self, fcev_list):
-        """添加新到达的FCEV"""
         self.fcev_queue.extend(fcev_list)
     
-    def step(self, h2_available_kg, dt=None):
+    def step(self, h2_available_350, h2_available_700, dt=None):
         """
         执行一个时间步
-        
+
+        参数:
+        - h2_available_350: T3₁+T3₂ 可供 350-bar 车型的氢气量 (kg)
+        - h2_available_700: T3₃+T3₂+T3₁ 级联可供 700-bar 车型经 C3 使用的氢气量 (kg)
+
         返回:
-        - fcev_h2_demand: FCEV氢气需求 (kg/h)
+        - h2_demand_350: 350-bar 需求 (kg/h)
+        - h2_demand_700: 700-bar 需求 (kg/h，送入 C3)
         - fcev_revenue: 加氢收入
         - unmet_demand_penalty: 未满足需求惩罚
         """
         if dt is None:
             dt = Config.dt
         
-        fcev_h2_demand = 0.0
-        fcev_revenue = 0.0
-        unmet_penalty = 0.0
-        
-        # 1. 更新正在服务的FCEV
         self._update_serving_vehicles(dt)
         
-        # 2. 处理FCEV加氢需求
-        fcev_flow, fcev_rev, fcev_penalty = self._serve_fcev_queue(h2_available_kg, dt)
-        fcev_h2_demand += fcev_flow
-        fcev_revenue += fcev_rev
-        unmet_penalty += fcev_penalty
+        h2_demand_350, h2_demand_700, revenue, penalty = \
+            self._serve_fcev_queue(h2_available_350, h2_available_700, dt)
         
-        # v3.1: 更新当前服务FCEV的平均SOG
-        if len(self.fcev_being_served) > 0:
-            total_sog = sum(fcev.sog_initial for fcev in self.fcev_being_served)
-            self.current_fcev_avg_sog = total_sog / len(self.fcev_being_served)
+        # 更新 700-bar 车的平均 SOG (用于 C3 APC)
+        serving_700 = [v for v in self.fcev_being_served if v.target_pressure == 700]
+        queue_700  = [v for v in self.fcev_queue if v.target_pressure == 700]
+        if serving_700:
+            self.current_fcev_700_avg_sog = sum(v.sog_initial for v in serving_700) / len(serving_700)
+        elif queue_700:
+            sample = queue_700[:3]
+            self.current_fcev_700_avg_sog = sum(v.sog_initial for v in sample) / len(sample)
         else:
-            if len(self.fcev_queue) > 0:
-                total_sog = sum(fcev.sog_initial for fcev in self.fcev_queue[:3])
-                self.current_fcev_avg_sog = total_sog / min(3, len(self.fcev_queue))
-            else:
-                self.current_fcev_avg_sog = 0.5
+            self.current_fcev_700_avg_sog = 0.5
         
-        return fcev_h2_demand, fcev_revenue, unmet_penalty
+        return h2_demand_350, h2_demand_700, revenue, penalty
     
     def _update_serving_vehicles(self, dt):
-        """更新正在服务的FCEV状态"""
         for fcev in self.fcev_being_served[:]:
-            if fcev.service_start_time is not None:
-                if dt >= fcev.fill_time_hours:
-                    fcev.is_completed = True
-                    self.fcev_being_served.remove(fcev)
-                    self.total_fcev_served += 1
-                    self.total_fcev_revenue += fcev.get_refueling_revenue()
+            if fcev.service_start_time is not None and dt >= fcev.fill_time_hours:
+                fcev.is_completed = True
+                self.fcev_being_served.remove(fcev)
+                self.total_fcev_served += 1
+                self.total_fcev_revenue += fcev.get_refueling_revenue()
     
-    def _serve_fcev_queue(self, h2_available, dt):
-        """服务FCEV队列"""
-        h2_flow_demand = 0.0
+    def _serve_fcev_queue(self, h2_available_350, h2_available_700, dt):
+        """按目标压力分别分配氢气资源"""
+        h2_demand_350 = 0.0
+        h2_demand_700 = 0.0
         revenue = 0.0
         penalty = 0.0
         
         available_dispensers = self.fcev_dispensers - len(self.fcev_being_served)
-        h2_available_this_step = h2_available * dt
+        avail_350 = h2_available_350 * dt  # 转换为本时段可用量 (kg)
+        avail_700 = h2_available_700 * dt
         
         for fcev in self.fcev_queue[:]:
-            if fcev.check_delay_eligibility(h2_available):
+            if available_dispensers <= 0:
+                break
+            
+            if fcev.target_pressure == 350:
+                h2_avail = avail_350
+            else:
+                h2_avail = avail_700
+            
+            if fcev.check_delay_eligibility(h2_avail / dt if dt > 0 else 0):
                 self.total_vehicles_delayed += 1
                 penalty += Config.penalty_vehicle_waiting * dt * 2
                 continue
             
-            if fcev.h2_needed <= h2_available_this_step and available_dispensers > 0:
+            if fcev.h2_needed <= h2_avail:
                 self.fcev_being_served.append(fcev)
                 self.fcev_queue.remove(fcev)
                 fcev.service_start_time = 0
                 fcev.is_being_served = True
-                h2_flow_demand += fcev.h2_flow_rate
                 revenue += fcev.get_refueling_revenue()
-                h2_available_this_step -= fcev.h2_needed
                 available_dispensers -= 1
+                if fcev.target_pressure == 350:
+                    h2_demand_350 += fcev.h2_flow_rate
+                    avail_350 -= fcev.h2_needed
+                else:
+                    h2_demand_700 += fcev.h2_flow_rate
+                    avail_700 -= fcev.h2_needed
             else:
                 penalty += Config.penalty_unmet_h2_demand * fcev.h2_needed * 0.1
         
-        return h2_flow_demand, revenue, penalty
+        return h2_demand_350, h2_demand_700, revenue, penalty
     
     def get_statistics(self):
-        """获取统计信息"""
+        queue_350 = sum(1 for v in self.fcev_queue if v.target_pressure == 350)
+        queue_700 = sum(1 for v in self.fcev_queue if v.target_pressure == 700)
         return {
             'fcev_served': self.total_fcev_served,
             'fcev_revenue': self.total_fcev_revenue,
             'vehicles_delayed': self.total_vehicles_delayed,
             'fcev_queue_length': len(self.fcev_queue),
+            'fcev_queue_350': queue_350,
+            'fcev_queue_700': queue_700,
             'fcev_being_served': len(self.fcev_being_served)
         }

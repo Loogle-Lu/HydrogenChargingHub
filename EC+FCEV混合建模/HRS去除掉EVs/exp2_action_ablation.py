@@ -1,17 +1,17 @@
 """
 实验2: 动作空间消融实验
 
-对比「完整 7 维动作(含压缩机智能控制)」与「Naive 固定压缩机动作(仅 3 维有效)」的收益差异。
+对比「完整 6 维动作(含压缩机智能控制)」与「Naive 固定压缩机动作(仅 2 维有效)」的收益差异。
 突出压缩机智能控制的边际贡献。
-(环境已移除BESS，EV充电来自 绿色能源+电网+H2转电)
+(环境已移除 EV，State 11D，Action 6D)
 
-- Full 7D: [ele, fc, comp_load, cooling, bypass, c3_pressure, chiller]
-- Naive Max Power 3D: [ele, fc, chiller]，压缩机固定为满负荷运行、无旁路、无级间冷却
-  [comp_load=1.0, cooling=0.0, bypass=0.0, c3_pressure=0.5]
+- Full 6D: [ele, fc, c1_load, c2_load, c3_pressure_bias, bypass_bias]
+- Naive Max Power 2D: [ele, fc]，压缩机固定为满负荷运行、无旁路
+  [c1_load=1.0, c2_load=1.0, c3_pressure_bias=0.5, bypass_bias=0.0]
   代表「无智能压缩机控制」的自然 Baseline:
-    - comp_load=1.0: 始终满负荷运行 (VSD 效率最低点 0.74)
-    - cooling=0.0:   无级间冷却优化 (入口温度最高, 压缩功最大)
-    - bypass=0.0:    从不旁路 (即使储罐压力充足也继续压缩)
+    - c1_load=c2_load=1.0: 始终满负荷运行
+    - bypass_bias=0.0: 从不旁路 (即使储罐压力充足也继续压缩)
+    - c3_pressure_bias=0.5: C3 APC 默认
 
 输出:
 - 图: Reward/Profit 柱状图(含误差棒) | Reward/Profit 曲线 | Compressor/Chiller/Bypass 指标
@@ -30,43 +30,42 @@ from config import Config
 
 # ======================== 配置 ========================
 NUM_RUNS = 5  # 增加 run 数以计算误差棒
-NUM_EPISODES = 150  # 增加至150: 7D 搜索空间更大, 需要更多步骤收敛
+NUM_EPISODES = 150  # 6D 搜索空间，需要足够步骤收敛
 WARMUP_STEPS = 400
 BATCH_SIZE = 256
 LR = 3e-4
 MA_WINDOW = 20
 
-# Naive 固定压缩机动作 (comp_load, cooling, bypass, c3_pressure)
-# [1.0, 0.0, 0.0, 0.5] = 满负荷/无冷却/无旁路/默认C3压力
-# 代表「无智能控制」的自然 Baseline (VSD效率最低, 能耗最高)
-FIXED_COMPRESSOR_ACTIONS = [1.0, 0.0, 0.0, 0.5]
+# Naive 固定压缩机动作 (c1_load, c2_load, c3_pressure_bias, bypass_bias)
+# [1.0, 1.0, 0.5, 0.0] = 满负荷/默认C3压力/无旁路
+# 代表「无智能控制」的自然 Baseline
+FIXED_COMPRESSOR_ACTIONS = [1.0, 1.0, 0.5, 0.0]
 
 
 class FixedCompressorActionWrapper(gym.ActionWrapper):
     """
-    将 7 维动作空间压缩为 3 维: [ele, fc, chiller]
-    压缩机相关维度固定为常量 (comp_load, cooling, bypass, c3_pressure)
+    将 6 维动作空间压缩为 2 维: [ele, fc]
+    压缩机相关维度固定为常量 (c1_load, c2_load, c3_pressure_bias, bypass_bias)
     """
     def __init__(self, env, fixed_compressor=None):
         super().__init__(env)
         if fixed_compressor is None:
             fixed_compressor = FIXED_COMPRESSOR_ACTIONS
         self.fixed = np.array(fixed_compressor, dtype=np.float32)
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(3,), dtype=np.float32)
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
 
     def action(self, action):
-        # action: [ele, fc, chiller]
+        # action: [ele, fc]
         a = np.asarray(action, dtype=np.float32).flatten()
-        if len(a) < 3:
-            a = np.pad(a, (0, 3 - len(a)), constant_values=0.5)
-        # 映射到 7 维: [ele, fc, comp_load, cooling, bypass, c3_pressure, chiller]
+        if len(a) < 2:
+            a = np.pad(a, (0, 2 - len(a)), constant_values=0.5)
+        # 映射到 6 维: [ele, fc, c1_load, c2_load, c3_pressure_bias, bypass_bias]
         full = np.array([
             a[0], a[1],           # ele, fc
-            self.fixed[0],        # comp_load
-            self.fixed[1],        # cooling
-            self.fixed[2],        # bypass
-            self.fixed[3],        # c3_pressure
-            a[2]                  # chiller
+            self.fixed[0],        # c1_load
+            self.fixed[1],        # c2_load
+            self.fixed[2],        # c3_pressure_bias
+            self.fixed[3],        # bypass_bias
         ], dtype=np.float32)
         return full
 
@@ -85,9 +84,9 @@ def moving_average(data, window):
     return np.convolve(data, np.ones(window) / window, mode="valid")
 
 
-def train_sac_full_7d(num_episodes, num_runs):
+def train_sac_full_6d(num_episodes, num_runs):
     """
-    SAC 完整 7 维动作 (无BESS)
+    SAC 完整 6 维动作 (含压缩机智能控制)
     返回: (all_rewards, all_profits, all_comp_energy, all_chiller_energy, all_bypass)
     均为 shape (num_runs, num_episodes)
     """
@@ -150,9 +149,9 @@ def train_sac_full_7d(num_episodes, num_runs):
     return arr(all_rewards), arr(all_profits), arr(all_comp_energy), arr(all_chiller_energy), arr(all_bypass)
 
 
-def train_sac_fixed_compressor_3d(num_episodes, num_runs):
+def train_sac_fixed_compressor_2d(num_episodes, num_runs):
     """
-    SAC 固定压缩机 (3 维有效动作)
+    SAC 固定压缩机 (2 维有效动作: ele, fc)
     返回: (all_rewards, all_profits, all_comp_energy, all_chiller_energy, all_bypass)
     """
     dt = Config.dt
@@ -226,22 +225,20 @@ def _last20_mean_std(arr):
 
 def main():
     print("=" * 60)
-    print("  实验2: 动作空间消融 (Full 7D vs Naive Max Power 3D)")
+    print("  实验2: 动作空间消融 (Full 6D vs Naive Max Power 2D)")
     print("=" * 60)
     print(f"  Runs: {NUM_RUNS}, Episodes: {NUM_EPISODES}")
-    print(f"  Naive Baseline: comp_load={FIXED_COMPRESSOR_ACTIONS[0]}, "
-          f"cooling={FIXED_COMPRESSOR_ACTIONS[1]}, "
-          f"bypass={FIXED_COMPRESSOR_ACTIONS[2]}, "
-          f"c3_pressure={FIXED_COMPRESSOR_ACTIONS[3]}")
+    print(f"  Naive Baseline: c1_load={FIXED_COMPRESSOR_ACTIONS[0]}, c2_load={FIXED_COMPRESSOR_ACTIONS[1]}, "
+          f"c3_pressure={FIXED_COMPRESSOR_ACTIONS[2]}, bypass={FIXED_COMPRESSOR_ACTIONS[3]}")
     print("=" * 60)
 
-    print("\n[1/2] Training SAC Full 7D (compressor intelligent control)...")
-    r_full, p_full, c_full, ch_full, bp_full = train_sac_full_7d(NUM_EPISODES, NUM_RUNS)
+    print("\n[1/2] Training SAC Full 6D (compressor intelligent control)...")
+    r_full, p_full, c_full, ch_full, bp_full = train_sac_full_6d(NUM_EPISODES, NUM_RUNS)
     rewards_full = np.mean(r_full, axis=0)
     profits_full = np.mean(p_full, axis=0)
 
-    print("\n[2/2] Training SAC Naive Max Power 3D (no compressor intelligence)...")
-    r_fix, p_fix, c_fix, ch_fix, bp_fix = train_sac_fixed_compressor_3d(NUM_EPISODES, NUM_RUNS)
+    print("\n[2/2] Training SAC Naive Max Power 2D (no compressor intelligence)...")
+    r_fix, p_fix, c_fix, ch_fix, bp_fix = train_sac_fixed_compressor_2d(NUM_EPISODES, NUM_RUNS)
     rewards_fixed = np.mean(r_fix, axis=0)
     profits_fixed = np.mean(p_fix, axis=0)
 
@@ -257,26 +254,26 @@ def main():
     bp_full_m, bp_full_s = _last20_mean_std(bp_full)
     bp_fix_m, bp_fix_s = _last20_mean_std(bp_fix)
 
-    print(f"\n  Full 7D:          Reward={r_full_m:.2f}±{r_full_s:.2f}, Profit=${p_full_m:.0f}±{p_full_s:.0f}, "
+    print(f"\n  Full 6D:          Reward={r_full_m:.2f}±{r_full_s:.2f}, Profit=${p_full_m:.0f}±{p_full_s:.0f}, "
           f"Comp={c_full_m:.0f}kWh, Chiller={ch_full_m:.1f}kWh, Bypass={bp_full_m:.1f}")
     print(f"  Naive Max Power: Reward={r_fix_m:.2f}±{r_fix_s:.2f}, Profit=${p_fix_m:.0f}±{p_fix_s:.0f}, "
           f"Comp={c_fix_m:.0f}kWh, Chiller={ch_fix_m:.1f}kWh, Bypass={bp_fix_m:.1f}")
     if p_fix_m != 0:
         profit_gain = (p_full_m - p_fix_m) / abs(p_fix_m) * 100
-        print(f"\n  Profit improvement (7D vs Naive): {profit_gain:+.1f}%")
+        print(f"\n  Profit improvement (6D vs Naive): {profit_gain:+.1f}%")
     if c_fix_m != 0:
         comp_saving = (c_fix_m - c_full_m) / c_fix_m * 100
-        print(f"  Compressor energy saving (7D vs Naive): {comp_saving:+.1f}%")
+        print(f"  Compressor energy saving (6D vs Naive): {comp_saving:+.1f}%")
 
     # ========== 绘图 2×3 ==========
     plt.rcParams["axes.unicode_minus"] = False
     plt.rcParams["font.size"] = 9
     fig, axs = plt.subplots(2, 3, figsize=(14, 9), constrained_layout=True)
-    fig.suptitle("Exp2: Action Space Ablation — Full 7D vs Naive Max Power 3D\n"
+    fig.suptitle("Exp2: Action Space Ablation — Full 6D vs Naive Max Power 2D\n"
                  "(Compressor Intelligent Control Contribution)",
                  fontsize=11, fontweight="bold")
 
-    names = ["Full 7D", "Naive Max Power 3D"]
+    names = ["Full 6D", "Naive Max Power 2D"]
     colors = ["#1f77b4", "#ff7f0e"]
     x = np.arange(2)
     width = 0.5
@@ -339,14 +336,14 @@ def main():
     # (f) Reward 与 Profit 曲线
     ep_range = range(MA_WINDOW - 1, len(rewards_full))
     axs[1, 2].plot(ep_range, moving_average(rewards_full, MA_WINDOW), color=colors[0],
-                   linewidth=2, label="Reward (Full 7D)")
+                   linewidth=2, label="Reward (Full 6D)")
     axs[1, 2].plot(ep_range, moving_average(rewards_fixed, MA_WINDOW), color=colors[1],
-                   linewidth=2, label="Reward (Fixed 3D)")
+                   linewidth=2, label="Reward (Fixed 2D)")
     ax2 = axs[1, 2].twinx()
     ax2.plot(ep_range, moving_average(profits_full, MA_WINDOW), color=colors[0],
-             linewidth=1.5, linestyle="--", alpha=0.8, label="Profit (Full 7D)")
+             linewidth=1.5, linestyle="--", alpha=0.8, label="Profit (Full 6D)")
     ax2.plot(ep_range, moving_average(profits_fixed, MA_WINDOW), color=colors[1],
-             linewidth=1.5, linestyle="--", alpha=0.8, label="Profit (Fixed 3D)")
+             linewidth=1.5, linestyle="--", alpha=0.8, label="Profit (Fixed 2D)")
     axs[1, 2].set_xlabel("Episode")
     axs[1, 2].set_ylabel("Reward", color="black")
     ax2.set_ylabel("Profit ($)", color="gray")
