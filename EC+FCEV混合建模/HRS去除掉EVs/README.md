@@ -34,17 +34,39 @@
 
 ## 更新日志
 
+**v4.3 (2026-02-24) - I2S 条件下 HRS 利润最大化：State/Action/Reward 重设**
 
+- **State 8D → 11D**
+  - 新增 `re_ratio`：可再生能源 / 电解槽额定功率，区分绿电(边际成本≈0)与网电，支撑「低价多制氢」
+  - 新增 `queue_350`、`queue_700`：两类 FCEV 排队分别观测，700-bar 高价值需求可见
+  - 电价归一化：`price / price_max` (price_max=0.20 $/kWh)
+  - 时段改为 sin/cos 循环编码，更好捕捉早晚高峰规律
 
+- **Action 6D（保持不变，语义更清晰）**
+  - [ele_ratio, fc_ratio, c1_load, c2_load, c3_pressure_bias, bypass_bias]
+  - ele/c1/c2：低买高卖与级联压缩机控制；fc：高价时 H₂→电卖网；FCEV 优先则 fc 收缩
 
+- **Reward 优先级**
+  - FCEV 加氢收入 >> FC 卖电 >> 购电成本
+  - 缺氢惩罚 (500$/kg) >> 服务单价，强制 T3 备货
+  - 新增 FCEV 排队等待惩罚：`penalty_fcev_wait`（5$/辆·step），700-bar 权重 1.5x
 
+- **Config 新增**
+  - `price_max`、`queue_max`：State 归一化
+  - `penalty_fcev_wait`：排队等待惩罚系数
+
+- **H₂ 取气顺序修正（同版本）**
+  - 350-bar 车：T3₂(350 bar) 优先 → T3₁(200 bar) 补充
+  - 700-bar 车：T3₃ → T3₂ → T3₁ 级联供 C3
+
+---
 
 **v4.2 (2026-02-24) - HRS去除EV，保留FuelCell卖电**
 
 - **移除EV**：删除 EVehicle、充电桩/队列/收入；`FCEVDemandGenerator`（仅FCEV）、`FCEVServiceStation`（仅加氢）
 - **保留FuelCell**：FC仍可H₂发电卖电；利润 `Profit = FCEV收入 + 售电收入 - 电费`
-- **State 8→7维**：去掉EV队列，[total_soc, T1, T2, 电价, RE, FCEV队列, 时段]
-- **Action 仍7维**：ele, fc, comp_load, cooling_intensity, bypass_bias, c3_pressure_bias, chiller_ratio
+- **State 8→7维**：去掉EV队列，[total_soc, T1, T2, 电价, RE, FCEV队列, 时段]（后续 v4.3 扩展为 11D）
+- **Action 6维**：ele, fc, c1_load, c2_load, c3_pressure_bias, bypass_bias
 
 ---
 

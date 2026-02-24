@@ -25,11 +25,28 @@ class HydrogenEnv(gym.Env):
         self.service_station = FCEVServiceStation()
 
         self.current_step = 0
-        # 动作空间 (7维): [ele_ratio, fc_ratio, comp_load_ratio, cooling_intensity, bypass_bias, c3_pressure_bias, chiller_ratio]
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(7,), dtype=np.float32)
-        
-        # 观察空间 (7维, 已移除EV队列): [总SOC, T1_SOC, T2_SOC, 电价, 可再生能源, FCEV队列长度, 时段]
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+        # 动作空间 (6维):
+        #   [ele_ratio, fc_ratio, c1_load, c2_load, c3_pressure_bias, bypass_bias]
+        #   ele_ratio:        电解槽功率比   — 低价时多制氢、高价时少制氢
+        #   fc_ratio:         FC 功率比      — 高价时 H₂→电卖网、FCEV 不足时保持 0
+        #   c1_load:          C1 负荷        — 控制 T1→T2 转运速率
+        #   c2_load:          C2 负荷        — 控制 T2→T3 转运速率 (填服务罐,FCEV 备货)
+        #   c3_pressure_bias: C3 APC 偏置   — 700-bar 充装压力精细控制
+        #   bypass_bias:      旁路积极程度   — 减少空压浪费
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(6,), dtype=np.float32)
+
+        # 观察空间 (11维):
+        #   [price_norm, re_ratio,
+        #    T1_soc, T2_soc, T3_1_soc, T3_2_soc, T3_3_soc,
+        #    queue_350, queue_700,
+        #    hour_sin, hour_cos]
+        #
+        #   price_norm : 当前电价/price_max         ← 低买高卖的核心信号
+        #   re_ratio   : 可再生能源/电解槽额定功率  ← 区分绿电(边际成本≈0)与网电
+        #   T3_1~3_soc : 350/700-bar 服务罐备货状态 ← FCEV 能否立即被服务
+        #   queue_350/700: 两类 FCEV 排队量         ← 当前服务压力，决定是否紧急补气
+        #   hour_sin/cos : 时段循环编码              ← 捕捉早/晚高峰需求规律
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
         self.state = None
         self.current_data = None
 
@@ -51,61 +68,71 @@ class HydrogenEnv(gym.Env):
         self.current_data = self.data_loader.get_step_data(self.current_step)
 
         re_power = self.current_data["wind"] + self.current_data["pv"]
-        total_soc = self.storage.get_total_soc()
         hour_of_day = int((self.current_step * Config.dt) % 24)
-        
+
         self.state = np.array([
-            total_soc,              # 总体氢气SOC
-            self.storage.t1.get_soc(),  # T1 SOC
-            self.storage.t2.get_soc(),  # T2 SOC
-            self.current_data["price"],  # 电价
-            re_power,               # 可再生能源
-            0.0,                    # FCEV队列长度 (初始为0)
-            hour_of_day / 24.0      # 时段归一化 (0-1)
+            # --- 市场信号 ---
+            self.current_data["price"] / Config.price_max,              # 电价归一化 [0,1+]
+            re_power / Config.ele_max_power,                            # 可再生能源比例 [0,1+]
+            # --- 储罐状态 ---
+            self.storage.t1.get_soc(),                                  # T1 SOC
+            self.storage.t2.get_soc(),                                  # T2 SOC
+            self.storage.t3_1.get_soc(),                                # T3₁ SOC (200 bar)
+            self.storage.t3_2.get_soc(),                                # T3₂ SOC (350 bar)
+            self.storage.t3_3.get_soc(),                                # T3₃ SOC (500 bar)
+            # --- FCEV 需求压力 ---
+            0.0,                                                        # 350-bar 排队 (初始为0)
+            0.0,                                                        # 700-bar 排队 (初始为0)
+            # --- 时段循环编码 ---
+            np.sin(2 * np.pi * hour_of_day / 24.0),                    # hour_sin
+            np.cos(2 * np.pi * hour_of_day / 24.0),                    # hour_cos
         ], dtype=np.float32)
         return self.state
     
-    def _compute_comp_block(self, h2_produced, fcev_h2_demand,
-                             comp_load_ratio, cooling_intensity,
-                             bypass_bias, c3_pressure_bias, price):
+    def _compute_comp_block(self, h2_produced, fcev_h2_demand_700,
+                             c1_load, c2_load, bypass_bias, c3_pressure_bias, price):
         """
         计算三级压缩链的功耗与流量。
+
+        C1: T1(2 bar) → T2(35 bar)      — c1_load 独立控制
+        C2: T2(35 bar) → T3₁/T3₂/T3₃  — c2_load 独立控制
+        C3: T3₃(500 bar) → 700 bar       — 需求驱动，c3_pressure_bias 控制 APC
+
+        cooling_intensity 固定 0.5，chiller_ratio 固定 0.8。
+
         返回: (c1_power, c2_power, c3_power,
                 c1_heat,  c2_heat,  c3_heat,
                 c1_flow,  c2_flow,  c3_flow)
-
-        可被子类覆写以对比不同压缩机架构 (Exp3 架构消融实验)。
         """
         t1_soc = self.storage.t1.get_soc()
         t2_soc = self.storage.t2.get_soc()
-        # 差压级联: T3₃(500bar) 是最高压储罐，C3 优先从中取气
         t3_avg_pressure = (self.storage.t3_1.max_pressure * self.storage.t3_1.get_soc() +
                            self.storage.t3_2.max_pressure * self.storage.t3_2.get_soc() +
                            self.storage.t3_3.max_pressure * self.storage.t3_3.get_soc()) / 3.0
-        # C3 在线取气: 以 T3₃ (500 bar) 作为 C3 入口压力参考，无 T4
         t3_3_pressure = self.storage.t3_3.max_pressure * self.storage.t3_3.get_soc()
-        avg_fcev_sog = self.service_station.current_fcev_avg_sog
+        # APC 只使用 700-bar 车的平均 SOG
+        avg_fcev_700_sog = self.service_station.current_fcev_700_avg_sog
 
-        c1_flow_base = h2_produced * min(1.0, max(0.5, t1_soc))
-        comp_scale = 0.4 + 0.6 * comp_load_ratio
-        c1_flow = c1_flow_base * comp_scale
+        # C1: RL 独立控制负荷
+        c1_scale = 0.4 + 0.6 * c1_load
+        c1_flow = h2_produced * min(1.0, max(0.5, t1_soc)) * c1_scale
         t2_pressure = Config.c1_output_pressure * t2_soc
         c1_power, c1_heat = self.comp_system.compute_c1(
             c1_flow, tank_pressure=t2_pressure, electricity_price=price,
-            cooling_intensity=cooling_intensity, bypass_bias=bypass_bias)
+            cooling_intensity=0.5, bypass_bias=bypass_bias)
 
-        c2_flow_base = c1_flow_base * min(1.0, max(0.4, t2_soc)) + fcev_h2_demand * 0.5
-        c2_flow = c2_flow_base * comp_scale
+        # C2: RL 独立控制负荷
+        c2_scale = 0.4 + 0.6 * c2_load
+        c2_flow_base = c1_flow * min(1.0, max(0.4, t2_soc))
+        c2_flow = c2_flow_base * c2_scale
         c2_power, c2_heat = self.comp_system.compute_c2(
             c2_flow, tank_pressure=t3_avg_pressure, electricity_price=price,
-            cooling_intensity=cooling_intensity, bypass_bias=bypass_bias)
+            cooling_intensity=0.5, bypass_bias=bypass_bias)
 
-        # C3: 差压在线直充 FCEV (取代 T4 缓冲罐)
-        # 流量随 FCEV 需求和差压可用量动态调整
-        c3_flow_base = fcev_h2_demand * 0.3
-        c3_flow = c3_flow_base * (0.6 + 0.4 * comp_load_ratio)
+        # C3: 需求驱动，仅从 T3₃ 取气，服务所有 700-bar 车型
+        c3_flow = min(fcev_h2_demand_700, Config.c3_max_flow)
         c3_power, c3_heat = self.comp_system.compute_c3(
-            c3_flow, avg_fcev_sog=avg_fcev_sog, tank_pressure=t3_3_pressure,
+            c3_flow, avg_fcev_sog=avg_fcev_700_sog, tank_pressure=t3_3_pressure,
             electricity_price=price, bypass_bias=bypass_bias,
             c3_pressure_bias=c3_pressure_bias)
 
@@ -115,22 +142,18 @@ class HydrogenEnv(gym.Env):
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float32).flatten()
-        if len(action) < 7:
-            # 向后兼容: 旧维度用默认值补齐 (7维: ele,fc,comp,cool,bypass,c3p,chill)
-            defaults = [0.7, 0.7, 0.7, 0.5, 0.5, 0.5, 0.7]
-            pad_len = 7 - len(action)
-            action = np.concatenate([action, np.array(defaults[len(action):7])])
-        # 若传入8维(含已弃用的battery_ratio)，则丢弃第5维
-        if len(action) > 7:
-            action = np.array([action[0], action[1], action[2], action[3], action[5], action[6], action[7]], dtype=np.float32)
+        # 6维动作: [ele_ratio, fc_ratio, c1_load, c2_load, c3_pressure_bias, bypass_bias]
+        defaults = [0.7, 0.5, 0.7, 0.7, 0.5, 0.5]
+        if len(action) < 6:
+            action = np.concatenate([action, np.array(defaults[len(action):6])])
+        action = action[:6]
 
-        ele_ratio = np.clip(action[0], 0, 1)
-        fc_ratio = np.clip(action[1], 0, 1)
-        comp_load_ratio = np.clip(action[2], 0, 1)
-        cooling_intensity = np.clip(action[3], 0, 1)
-        bypass_bias = np.clip(action[4], 0, 1)        # 0=保守 1=积极旁路
-        c3_pressure_bias = np.clip(action[5], 0, 1)   # 0.5=默认 0=降压 1=升压
-        chiller_ratio = np.clip(action[6], 0, 1)      # 0=最小制冷 1=全制冷
+        ele_ratio        = np.clip(action[0], 0, 1)
+        fc_ratio         = np.clip(action[1], 0, 1)
+        c1_load          = np.clip(action[2], 0, 1)   # C1 压缩机负荷
+        c2_load          = np.clip(action[3], 0, 1)   # C2 压缩机负荷
+        c3_pressure_bias = np.clip(action[4], 0, 1)   # C3 APC 偏置 (0=降压, 1=升压)
+        bypass_bias      = np.clip(action[5], 0, 1)   # 旁路积极程度
 
         price = self.current_data["price"]
         re_gen = self.current_data["wind"] + self.current_data["pv"]
@@ -145,28 +168,34 @@ class HydrogenEnv(gym.Env):
         ele_power_target = ele_ratio * Config.ele_max_power
         h2_produced, ele_actual_power, green_h2_ratio, power_from_re, power_from_grid = \
             self.ele.compute(ele_power_target, re_gen)
+
+        # --- 3. 燃料电池需要的H₂量 (只从 T3₁ 取气) ---
+        fc_power_target = fc_ratio * Config.fc_max_power
+        h2_needed_for_fc = fc_power_target / self.fc.efficiency
+
+        # --- 4. 计算各压力级别的可用氢气 ---
+        # 350-bar 车: T3₁ + T3₂ (T3₂ 优先, T3₁ 补充)
+        h2_avail_350 = (self.storage.t3_1.level + self.storage.t3_2.level) * 0.8
+        # 700-bar 车: T3₃ + T3₂ + T3₁ 级联 (T3₃→T3₂→T3₁ 经 C3 升压)
+        h2_avail_700 = (self.storage.t3_1.level + self.storage.t3_2.level + self.storage.t3_3.level) * 0.8
         
-        # --- 4. 计算可用氢气 (用于FCEV加氢) ---
-        t3_available_h2 = (self.storage.t3_1.level + self.storage.t3_2.level + 
-                          self.storage.t3_3.level) * 0.8  # 80%可用于加氢
+        # --- 5. 服务 FCEV 需求 (350-bar 和 700-bar 分离) ---
+        fcev_h2_demand_350, fcev_h2_demand_700, fcev_revenue, service_penalty = \
+            self.service_station.step(h2_avail_350, h2_avail_700, Config.dt)
         
-        # --- 5. 服务FCEV需求 (已移除EV) ---
-        fcev_h2_demand, fcev_revenue, service_penalty = \
-            self.service_station.step(t3_available_h2, Config.dt)
-        
-        # --- 6. 多级压缩链 (可被子类覆写以做架构消融实验) ---
+        # --- 6. 多级压缩链 ---
         (c1_power, c2_power, c3_power,
          c1_heat, c2_heat, c3_heat,
          c1_flow, c2_flow, c3_flow) = self._compute_comp_block(
-            h2_produced, fcev_h2_demand,
-            comp_load_ratio, cooling_intensity, bypass_bias, c3_pressure_bias, price
+            h2_produced, fcev_h2_demand_700,
+            c1_load, c2_load, bypass_bias, c3_pressure_bias, price
         )
         total_comp_heat = c1_heat + c2_heat + c3_heat
         
-        # --- 7. 线性Chiller (v3.6: chiller_ratio 控制制冷强度) ---
-        chiller_power = self.chiller.compute_power(total_comp_heat, chiller_ratio=chiller_ratio)
+        # --- 7. Chiller (固定 0.8 制冷强度) ---
+        chiller_power = self.chiller.compute_power(total_comp_heat, chiller_ratio=0.8)
         
-        # --- 8. 总电力负荷 (仅制氢链，已无EV充电) ---
+        # --- 8. 总电力负荷 ---
         h2_production_load = ele_actual_power + c1_power + c2_power + c3_power + chiller_power
         total_load = h2_production_load
 
@@ -177,25 +206,22 @@ class HydrogenEnv(gym.Env):
             h2_from_c1=c1_flow,
             h2_to_c2=c2_flow,
             h2_from_c2=c2_flow,
-            h2_demand=fcev_h2_demand,  # FCEV加氢需求
-            h2_to_c3=c3_flow,
+            h2_demand_350=fcev_h2_demand_350,  # 350-bar: T3₂→T3₁ 优先
+            h2_for_fc=h2_needed_for_fc,         # FC: T3₁ only
+            h2_to_c3=c3_flow,                   # C3 取气: T3₃→T3₂→T3₁ 级联
             h2_from_c3=c3_flow
         )
 
-        # --- 10. 燃料电池发电 (应对高负荷或高电价) ---
-        fc_power_target = fc_ratio * Config.fc_max_power
-        h2_needed_for_fc = fc_power_target / self.fc.efficiency
-        
-        # 处理缺氢
+        # --- 10. 燃料电池实际发电 (T3₁ 供气, 缺氢时按比例降低) ---
         supply_ratio = 1.0
         if shortage_h2 > 0:
-            available_h2 = fcev_h2_demand + h2_needed_for_fc - shortage_h2
-            if (fcev_h2_demand + h2_needed_for_fc) > 0:
-                supply_ratio = max(0, available_h2 / (fcev_h2_demand + h2_needed_for_fc))
+            total_demand = fcev_h2_demand_350 + fcev_h2_demand_700 + h2_needed_for_fc
+            if total_demand > 0:
+                supply_ratio = max(0.0, (total_demand - shortage_h2) / total_demand)
 
-        real_fcev_h2_supplied = fcev_h2_demand * supply_ratio
         real_fc_h2_used = h2_needed_for_fc * supply_ratio
         fc_actual_power, _ = self.fc.compute(real_fc_h2_used)
+        fcev_h2_demand = fcev_h2_demand_350 + fcev_h2_demand_700  # 合并用于统计
 
         # --- 11. 电网互动与财务 (已移除EV) ---
         # 供应: FC(H2转电) + 剩余可再生能源 | 需求: 制氢链负荷
@@ -248,11 +274,17 @@ class HydrogenEnv(gym.Env):
         revenue_grid = min(revenue_grid_raw, revenue_grid_cap)
         
         # 惩罚
-        penalty = service_penalty  # 未满足服务惩罚
-        if shortage_h2 > 0: 
+        penalty = service_penalty  # 未满足服务惩罚 (FCEV 离开队列未被服务)
+        if shortage_h2 > 0:
+            # 缺氢惩罚 >> FCEV 服务单价，强制 agent 优先保证 T3 备货
             penalty += shortage_h2 * Config.penalty_unmet_h2_demand
-        if excess_h2 > 0: 
+        if excess_h2 > 0:
             penalty += excess_h2 * 10
+        # FCEV 排队等待惩罚: 促使 agent 提前补气, 700-bar 权重 1.5x (收益更高)
+        # 此惩罚仅在有排队时触发，正常服务时为 0，不抑制吞吐
+        cur_stats = self.service_station.get_statistics()
+        penalty += cur_stats['fcev_queue_350'] * Config.penalty_fcev_wait
+        penalty += cur_stats['fcev_queue_700'] * Config.penalty_fcev_wait * 1.5
 
         # 压缩机效率激励: 奖励低于参考基准的单位氢气能耗
         # 仅计入 Reward (训练信号), 不影响 Profit (真实经济指标)
@@ -267,15 +299,14 @@ class HydrogenEnv(gym.Env):
                                          * Config.comp_eff_bonus_coef)
 
         # =========================================================================
-        # [核心修正 v3.5] 区分 "真实利润(Profit)" 和 "强化学习奖励(Reward)"
+        # 区分 "真实利润(Profit)" 和 "强化学习奖励(Reward)"
         # =========================================================================
-        
-        # 1. 真实经济利润 (用于绘图和评估): 真金白银，不含人工奖励
-        #    Profit = FCEV收入 + 售电收入(FC卖电) - 电费成本
+        # 1. 真实经济利润 (绘图/评估): 真金白银，不含人工奖励
+        #    Profit = FCEV加氢收入 + FC卖电收入 - 购电成本
         step_profit = revenue_fcev + revenue_grid - cost_grid
 
-        # 2. 强化学习奖励 (用于训练): 包含人工引导信号(arbitrage_bonus, comp_efficiency_bonus) 和 惩罚
-        #    Reward = Profit + 套利奖励 + 压缩效率奖励 - 惩罚
+        # 2. 强化学习奖励 (训练): Profit + 套利引导 + 压缩效率引导 - 惩罚(缺氢+排队)
+        #    收益优先级: FCEV(18/12$/kg) >> FC电(~0.54$/kg) >> 套利奖励(辅助)
         step_reward = step_profit + arbitrage_bonus + comp_efficiency_bonus - penalty
         # =========================================================================
 
@@ -289,24 +320,34 @@ class HydrogenEnv(gym.Env):
             i2s_penalty = abs(final_soc - init_soc) * Config.i2s_penalty_weight
             step_reward -= i2s_penalty
 
-        # --- v3.5: 奖励裁剪，抑制极端值以稳定训练 ---
+        # --- 奖励裁剪，抑制极端值以稳定训练 ---
         step_reward = np.clip(step_reward, -5000.0, 5000.0)
 
         # --- 更新状态 ---
         self.current_data = self.data_loader.get_step_data(self.current_step)
         next_re = self.current_data["wind"] + self.current_data["pv"]
         next_hour = int((self.current_step * Config.dt) % 24)
-        
-        station_stats = self.service_station.get_statistics()
+
+        station_stats = cur_stats  # 复用刚取到的统计，避免重复调用
+        q350 = station_stats['fcev_queue_350']
+        q700 = station_stats['fcev_queue_700']
 
         self.state = np.array([
-            self.storage.get_total_soc(),
-            self.storage.t1.get_soc(),
-            self.storage.t2.get_soc(),
-            self.current_data["price"],
-            next_re,
-            min(station_stats['fcev_queue_length'] / 5.0, 1.0),  # 归一化FCEV队列
-            next_hour / 24.0  # 时段
+            # --- 市场信号 (下一步, 已提前知道) ---
+            self.current_data["price"] / Config.price_max,              # 电价归一化
+            next_re / Config.ele_max_power,                             # 可再生能源比例
+            # --- 储罐状态 ---
+            self.storage.t1.get_soc(),                                  # T1 SOC
+            self.storage.t2.get_soc(),                                  # T2 SOC
+            self.storage.t3_1.get_soc(),                                # T3₁ SOC (200 bar)
+            self.storage.t3_2.get_soc(),                                # T3₂ SOC (350 bar)
+            self.storage.t3_3.get_soc(),                                # T3₃ SOC (500 bar)
+            # --- FCEV 需求压力 (分类，高价值 700-bar 可见) ---
+            min(q350 / Config.queue_max, 1.0),                          # 350-bar 排队归一化
+            min(q700 / Config.queue_max, 1.0),                          # 700-bar 排队归一化
+            # --- 时段循环编码 ---
+            np.sin(2 * np.pi * next_hour / 24.0),                       # hour_sin
+            np.cos(2 * np.pi * next_hour / 24.0),                       # hour_cos
         ], dtype=np.float32)
 
         info = {
@@ -316,7 +357,6 @@ class HydrogenEnv(gym.Env):
             "net_power": net_power,
             "re_gen": re_gen,
             "fc_power": fc_actual_power,
-            "load_power": total_load,
             "h2_production_load": h2_production_load,
             "total_load": total_load,
             "comp_power": c1_power + c2_power + c3_power,
@@ -326,17 +366,21 @@ class HydrogenEnv(gym.Env):
             "chiller_power": chiller_power,
             "bypass_activations": self.comp_system.bypass_activations.copy(),
             "tank_socs": self.storage.get_tank_socs(),
-            # FCEV统计 (已移除EV)
+            # FCEV需求分解
             "fcev_served": station_stats['fcev_served'],
             "fcev_revenue": fcev_revenue,
+            "fcev_h2_demand_350": fcev_h2_demand_350,
+            "fcev_h2_demand_700": fcev_h2_demand_700,
             "fcev_queue": station_stats['fcev_queue_length'],
+            "fcev_queue_350": station_stats['fcev_queue_350'],
+            "fcev_queue_700": station_stats['fcev_queue_700'],
             "vehicles_delayed": station_stats['vehicles_delayed'],
             # 绿氢统计
             "green_h2_ratio": green_h2_ratio,
             "power_from_re": power_from_re,
             "power_from_grid": power_from_grid,
             "ele_power": ele_actual_power,
-            # 储能套利统计 & 压缩效率激励
+            # 套利 & 压缩效率激励
             "arbitrage_bonus": arbitrage_bonus,
             "comp_efficiency_bonus": comp_efficiency_bonus,
             "price": price,
@@ -345,12 +389,11 @@ class HydrogenEnv(gym.Env):
             "revenue_grid": revenue_grid,
             "revenue_grid_raw": revenue_grid_raw,
             "cost_grid": cost_grid,
-            # 控制动作
-            "comp_load_ratio": comp_load_ratio,
-            "cooling_intensity": cooling_intensity,
+            # 控制动作 (6维)
+            "c1_load": c1_load,
+            "c2_load": c2_load,
             "bypass_bias": bypass_bias,
             "c3_pressure_bias": c3_pressure_bias,
-            "chiller_ratio": chiller_ratio,
             "h2_sold": fcev_h2_demand * supply_ratio
         }
 
