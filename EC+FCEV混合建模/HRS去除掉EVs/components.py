@@ -893,7 +893,7 @@ class FCEVDemandGenerator:
                 if hour_of_day in Config.peak_morning_hours or hour_of_day in Config.peak_evening_hours:
                     base_multiplier *= 1.1
         
-        return base_multiplier * np.random.uniform(0.85, 1.15)
+        return base_multiplier * np.random.uniform(0.6, 1.4)
     
     def generate_vehicles(self, current_step):
         """
