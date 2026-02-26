@@ -29,11 +29,11 @@ from SAC import SAC, ReplayBuffer
 
 # ======================== 配置 ========================
 NUM_RUNS = 3
-NUM_EPISODES = 80
-WARMUP_STEPS = 400
+NUM_EPISODES = 200
+WARMUP_STEPS = 500
 BATCH_SIZE = 256
 LR = 3e-4
-MA_WINDOW = 15
+MA_WINDOW = 20
 
 COLORS = {
     "1-Stage Naive":  "#d62728",   # 红
@@ -98,35 +98,48 @@ class NaiveArchEnv(HydrogenEnv):
 
     def _compute_comp_block(self, h2_produced, fcev_h2_demand_700,
                              c1_load, c2_load, bypass_bias, c3_pressure_bias, price):
-        """覆写：朴素架构功耗计算（物理 H₂ 流量与父类相同，仅功耗不同）。
-        签名与父类 HydrogenEnv._compute_comp_block 一致 (v4.3 State 11D, Action 6D)。
+        """覆写：朴素架构功耗计算（流量与父类 v4.4 一致——需求驱动，仅功耗不同）。
+        签名与父类 HydrogenEnv._compute_comp_block 一致。
         """
         t1_soc = self.storage.t1.get_soc()
         t2_soc = self.storage.t2.get_soc()
-        # 流量计算：与父类结构一致，comp_scale 取 c1/c2 平均 (Naive 不区分)
-        comp_scale = 0.4 + 0.6 * ((c1_load + c2_load) / 2.0)
-        c1_flow = h2_produced * min(1.0, max(0.5, t1_soc)) * comp_scale
-        c2_flow_base = c1_flow * min(1.0, max(0.4, t2_soc))
-        c2_flow = c2_flow_base * comp_scale
-        c3_flow = min(fcev_h2_demand_700, Config.c3_max_flow)  # 与父类一致，需求驱动
+        # 流量计算: 需求驱动 (与父类 v4.4 一致, 保证公平对比)
+        c1_flow = h2_produced * min(1.0, max(0.5, t1_soc))
+        c1_flow = min(c1_flow, Config.c1_max_flow)
+        t3_avg_soc = (self.storage.t3_1.get_soc() + self.storage.t3_2.get_soc() +
+                      self.storage.t3_3.get_soc()) / 3.0
+        t3_deficit = max(0.0, 0.9 - t3_avg_soc)
+        c2_flow = c1_flow * min(1.0, max(0.4, t2_soc)) * min(1.0, 0.5 + t3_deficit)
+        c2_flow = min(c2_flow, Config.c2_max_flow)
+        c3_flow = min(fcev_h2_demand_700, Config.c3_max_flow)
 
         if self.arch == "naive_1stage":
-            # 所有 H₂ 从 2 bar 直压到 700 bar，压比 = 350，热力学代价极大
-            # 代表流量取 c1_flow（主流量，对应总制氢输入）
+            # 单级: 所有 H₂ 从 2 bar 直压到 700 bar (压比=350, 热力学代价极大)
+            # 必须对全部三段流量分别计算 2→700 bar 的压缩功
             p1, h1 = self._isentropic_kw(c1_flow, 2.0, 700.0)
-            return p1, 0.0, 0.0,  h1, 0.0, 0.0,  c1_flow, c2_flow, c3_flow
+            p2, h2 = self._isentropic_kw(c2_flow, 2.0, 700.0)
+            p3, h3 = self._isentropic_kw(c3_flow, 2.0, 700.0)
+            return p1, p2, p3,  h1, h2, h3,  c1_flow, c2_flow, c3_flow
 
         elif self.arch == "naive_2stage":
-            # 两级: C1(2→35) + C2_combined(35→700)
-            # T_in 对 C2 假设理想回温（固定 T_in），但无动态控制
-            p1, h1 = self._isentropic_kw(c1_flow, 2.0, 35.0)
-            # 第二级处理 c2_flow（需要从 35 bar 升压到 700 bar 直接送 FCEV）
-            p2, h2 = self._isentropic_kw(c2_flow, 35.0, 700.0)
-            return p1, p2, 0.0,  h1, h2, 0.0,  c1_flow, c2_flow, c3_flow
+            # 两级: 第一级 2→35 bar, 第二级 35→700 bar
+            # 三段流量均需通过两级压缩
+            p1_a, h1_a = self._isentropic_kw(c1_flow, 2.0, 35.0)
+            p1_b, h1_b = self._isentropic_kw(c1_flow, 35.0, 700.0)
+            p2_a, h2_a = self._isentropic_kw(c2_flow, 2.0, 35.0)
+            p2_b, h2_b = self._isentropic_kw(c2_flow, 35.0, 700.0)
+            p3_a, h3_a = self._isentropic_kw(c3_flow, 2.0, 35.0)
+            p3_b, h3_b = self._isentropic_kw(c3_flow, 35.0, 700.0)
+            total_p1 = p1_a + p1_b
+            total_p2 = p2_a + p2_b
+            total_p3 = p3_a + p3_b
+            total_h1 = h1_a + h1_b
+            total_h2 = h2_a + h2_b
+            total_h3 = h3_a + h3_b
+            return total_p1, total_p2, total_p3,  total_h1, total_h2, total_h3,  c1_flow, c2_flow, c3_flow
 
         elif self.arch == "naive_3stage":
-            # 三级：与本文架构相同的压力分级，但无四项智能特性
-            # 四项特性已在 __init__ 中关闭，直接用等熵公式
+            # 三级: 与本文架构相同的压力分级，但无四项智能特性
             p1, h1 = self._isentropic_kw(c1_flow, 2.0,   35.0)
             p2, h2 = self._isentropic_kw(c2_flow, 35.0,  500.0)
             p3, h3 = self._isentropic_kw(c3_flow, 500.0, 700.0)

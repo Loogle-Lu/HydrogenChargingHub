@@ -115,7 +115,7 @@ class Compressor:
         - 当 cooling_intensity 为 None 时，使用原电价启发式
         """
         if not Config.enable_dynamic_cooling:
-            return Config.T_in  # 默认回到进口温度
+            return Config.no_cooling_intercool_temp  # 无动态冷却 → 最高温度(最差工况)
         
         if cooling_intensity is not None:
             # RL Agent 直接控制: 0=轻度, 1=深度

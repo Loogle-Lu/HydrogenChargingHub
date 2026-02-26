@@ -5,11 +5,11 @@
 突出压缩机智能控制的边际贡献。
 (环境已移除 EV，State 11D，Action 6D)
 
-- Full 6D: [ele, fc, c1_load, c2_load, c3_pressure_bias, bypass_bias]
-- Naive Max Power 2D: [ele, fc]，压缩机固定为满负荷运行、无旁路
-  [c1_load=1.0, c2_load=1.0, c3_pressure_bias=0.5, bypass_bias=0.0]
+- Full 6D: [ele, fc, c1_cool, c2_cool, c3_pressure_bias, bypass_bias]
+- Naive No-Intelligence 2D: [ele, fc]，压缩机固定无冷却优化、无旁路
+  [c1_cool=0.0, c2_cool=0.0, c3_pressure_bias=0.5, bypass_bias=0.0]
   代表「无智能压缩机控制」的自然 Baseline:
-    - c1_load=c2_load=1.0: 始终满负荷运行
+    - c1_cool=c2_cool=0.0: 无冷却优化 (轻度冷却, 最高温度)
     - bypass_bias=0.0: 从不旁路 (即使储罐压力充足也继续压缩)
     - c3_pressure_bias=0.5: C3 APC 默认
 
@@ -36,16 +36,16 @@ BATCH_SIZE = 256
 LR = 3e-4
 MA_WINDOW = 20
 
-# Naive 固定压缩机动作 (c1_load, c2_load, c3_pressure_bias, bypass_bias)
-# [1.0, 1.0, 0.5, 0.0] = 满负荷/默认C3压力/无旁路
+# Naive 固定压缩机动作 (c1_cool, c2_cool, c3_pressure_bias, bypass_bias)
+# [0.0, 0.0, 0.5, 0.0] = 无冷却优化/默认C3压力/无旁路
 # 代表「无智能控制」的自然 Baseline
-FIXED_COMPRESSOR_ACTIONS = [1.0, 1.0, 0.5, 0.0]
+FIXED_COMPRESSOR_ACTIONS = [0.0, 0.0, 0.5, 0.0]
 
 
 class FixedCompressorActionWrapper(gym.ActionWrapper):
     """
     将 6 维动作空间压缩为 2 维: [ele, fc]
-    压缩机相关维度固定为常量 (c1_load, c2_load, c3_pressure_bias, bypass_bias)
+    压缩机相关维度固定为常量 (c1_cool, c2_cool, c3_pressure_bias, bypass_bias)
     """
     def __init__(self, env, fixed_compressor=None):
         super().__init__(env)
@@ -59,7 +59,7 @@ class FixedCompressorActionWrapper(gym.ActionWrapper):
         a = np.asarray(action, dtype=np.float32).flatten()
         if len(a) < 2:
             a = np.pad(a, (0, 2 - len(a)), constant_values=0.5)
-        # 映射到 6 维: [ele, fc, c1_load, c2_load, c3_pressure_bias, bypass_bias]
+        # 映射到 6 维: [ele, fc, c1_cool, c2_cool, c3_pressure_bias, bypass_bias]
         full = np.array([
             a[0], a[1],           # ele, fc
             self.fixed[0],        # c1_load

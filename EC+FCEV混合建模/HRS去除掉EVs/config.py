@@ -53,8 +53,9 @@ class Config:
     
     # v3.1: 动态级间冷却 (Dynamic Intercooling)
     enable_dynamic_cooling = True  # 启用动态冷却
-    min_intercool_temp = 300.15  # K (27°C) 深度冷却
+    min_intercool_temp = 293.15  # K (20°C) 深度冷却 (必须 < T_in=298.15K)
     max_intercool_temp = 313.15  # K (40°C) 轻度冷却
+    no_cooling_intercool_temp = 313.15  # K 无动态冷却时回退到最高温度(最差工况)
     cooling_price_threshold = 0.10  # $/kWh 高于此电价则轻度冷却
     
     # v3.1: 压力自适应控制 (Adaptive Pressure, APC)
@@ -286,4 +287,7 @@ class Config:
     # 当 actual_kWh_per_kg < comp_eff_ref_kWh_per_kg 时触发正向奖励
     enable_comp_eff_bonus = True   # True=开启压缩效率激励 (推荐 exp2 开启)
     comp_eff_ref_kWh_per_kg = 3.0  # 参考基准能耗 (kWh/kg H2); Naive 基线约在此值附近
-    comp_eff_bonus_coef = 30.0     # 激励系数: saving 1 kWh/kg × 0.1 kg H2 → +3 reward units
+    comp_eff_bonus_coef = 10.0     # v4.4: 降低系数, 乘以电价使激励与真实省钱挂钩
+
+    # FCEV 服务吞吐量激励: 直接奖励服务更多车辆 (确保 Smart 不因省电而牺牲服务)
+    fcev_throughput_bonus = 15.0   # $/vehicle 服务一辆 FCEV 的额外奖励
