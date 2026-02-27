@@ -4,7 +4,7 @@
 
 ![HRS System Architecture](../../HRS.png)
 
-**级联压缩机内部结构**：
+## 级联压缩机内部结构：
 
 ![Cascade Compressor](../../cascade%20compressor.png)
 
