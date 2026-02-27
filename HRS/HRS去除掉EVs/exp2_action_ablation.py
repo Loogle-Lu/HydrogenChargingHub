@@ -29,8 +29,8 @@ from config import Config
 
 
 # ======================== 配置 ========================
-NUM_RUNS = 5  # 增加 run 数以计算误差棒
-NUM_EPISODES = 150  # 6D 搜索空间，需要足够步骤收敛
+NUM_RUNS = 1  # 增加 run 数以计算误差棒
+NUM_EPISODES = 500  # 6D 搜索空间，需要足够步骤收敛
 WARMUP_STEPS = 400
 BATCH_SIZE = 256
 LR = 3e-4

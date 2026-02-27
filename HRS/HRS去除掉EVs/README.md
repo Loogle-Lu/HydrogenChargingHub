@@ -2,7 +2,11 @@
 
 ## 系统架构图
 
-![System Architecture](../../system_architecture_diagram.png)
+![HRS System Architecture](../../HRS.png)
+
+**级联压缩机内部结构**：
+
+![Cascade Compressor](../../cascade%20compressor.png)
 
 **系统组成说明**：
 - **能源输入层**: 可再生能源(PV+Wind) + 电网 → 电力母线
@@ -33,6 +37,38 @@
 ---
 
 ## 更新日志
+
+**v4.4 (2026-02-26) - 消融实验修复 + Action 解耦 + 奖励重设计**
+
+针对 Exp1/Exp2/Exp3 消融实验中「Naive 优于 Smart」「w/o Cooling 利润最高」「6D 利润低于 2D」等反常现象，完成以下修复与重设计：
+
+- **Exp3 级联架构消融修复**
+  - 修复 1-Stage/2-Stage Naive 压缩功耗严重低估：原先 c2_flow/c3_flow 对应功率为 0（“免费压缩”），现对全部流量正确计算 2→700 bar 或 2→35→700 bar 的等熵功
+  - 统一 NaiveArchEnv 与 HydrogenEnv 的流量计算逻辑（需求驱动），保证公平对比
+  - 训练量提升：80→200 episodes，1→3 runs
+
+- **Exp1 动态冷却基线修复**
+  - 修复 `enable_dynamic_cooling=False` 时回退到 `T_in=298.15K` 的 Bug（比开启时更低，导致“关冷却反更优”）
+  - 新增 `no_cooling_intercool_temp=313.15K`，无动态冷却时回退到最高温度（最差工况）
+  - `min_intercool_temp`: 300.15K → 293.15K，使深度冷却优势更明显
+
+- **Action 解耦（核心设计变更）**
+  - 原 `c1_load`/`c2_load` 同时控制 VSD 效率与流量，导致 Agent 省电即减产，利润下降
+  - 现 `c1_load`/`c2_load` 改为 `c1_cool`/`c2_cool`：仅控制级间冷却强度（0=轻度，1=深度），不影响流量
+  - 流量由储罐需求驱动（T1/T2 SOC、T3 deficit），最大化吞吐量
+
+- **奖励函数调整**
+  - `comp_eff_bonus`：乘以电价，使激励与真实节能量挂钩；系数 30→10
+  - 新增 `fcev_throughput_bonus`：直接奖励每服务一辆 FCEV，避免 Smart 为省电牺牲服务
+  - 压缩效率激励不再与吞吐量对抗
+
+- **Exp2 Naive Baseline 更新**
+  - 固定压缩机动作为 `[0.0, 0.0, 0.5, 0.0]`（无冷却优化、无旁路）
+
+- **Config 新增**
+  - `no_cooling_intercool_temp`、`fcev_throughput_bonus`
+
+---
 
 **v4.3 (2026-02-24) - I2S 条件下 HRS 利润最大化：State/Action/Reward 重设**
 
