@@ -91,14 +91,17 @@ class HydrogenEnv(gym.Env):
         return self.state
     
     def _compute_comp_block(self, h2_produced,
-                             c1_cool, c2_cool, bypass_bias, c3_pressure_bias, price):
+                             c1_load, c2_load, bypass_bias, c3_pressure_bias, price):
         """
         计算 C1/C2 压缩链的功耗与流量.
 
-        v4.8 设计: 流量完全由需求驱动, c1_cool/c2_cool 仅控制冷却强度:
-          - 流量 = f(h2_produced, T1_SOC, T2_SOC, T3_deficit)  (需求驱动, 保证吞吐)
-          - c_cool → cooling_intensity                          (0=轻冷却省冷却电, 1=深冷却省压缩功)
-        解耦后 Smart 优势来自"同等吞吐下更省电", 而非"靠少压缩换节能".
+        v4.5 设计: c1_load/c2_load 同时控制 **流量缩放** 和 **冷却强度**:
+          - c_load → flow_scale = 0.3 + 0.7×c_load  (映射到 [30%, 100%] 的需求驱动流量)
+          - c_load → cooling_intensity = c_load       (高负载→深冷却, 物理合理)
+        这赋予 RL Agent 压缩时序套利能力:
+          低电价 → c_load↑ → 全速压缩填满 T3
+          高电价 → c_load↓ → 减速压缩靠 T3 库存
+        v4.5 动态压力门控自然约束: T3 SOC↓ → 级联直充能力↓ → 缺氢惩罚
 
         返回: (c1_power, c2_power, c1_heat, c2_heat, c1_flow, c2_flow)
         """
@@ -108,38 +111,27 @@ class HydrogenEnv(gym.Env):
                            self.storage.t3_2.max_pressure * self.storage.t3_2.get_soc() +
                            self.storage.t3_3.max_pressure * self.storage.t3_3.get_soc()) / 3.0
 
-        # C1: 流量完全由需求驱动
+        # C1: 需求驱动基础流量 × Agent 流量缩放
+        c1_flow_scale = 0.3 + 0.7 * c1_load  # [0.3, 1.0]
         c1_base_flow = h2_produced * min(1.0, max(0.5, t1_soc))
-        c1_flow = min(c1_base_flow, Config.c1_max_flow)
+        c1_flow = min(c1_base_flow * c1_flow_scale, Config.c1_max_flow)
         t2_pressure = Config.c1_output_pressure * t2_soc
         c1_power, c1_heat = self.comp_system.compute_c1(
             c1_flow, tank_pressure=t2_pressure, electricity_price=price,
-            cooling_intensity=c1_cool, bypass_bias=bypass_bias)
+            cooling_intensity=c1_load, bypass_bias=bypass_bias)
 
-        # C2: 流量完全由需求驱动
+        # C2: 需求驱动基础流量 × Agent 流量缩放
+        c2_flow_scale = 0.3 + 0.7 * c2_load
         t3_avg_soc = (self.storage.t3_1.get_soc() + self.storage.t3_2.get_soc() +
                       self.storage.t3_3.get_soc()) / 3.0
         t3_deficit = max(0.0, 0.9 - t3_avg_soc)
         c2_base_flow = c1_flow * min(1.0, max(0.4, t2_soc)) * min(1.0, 0.5 + t3_deficit)
-        c2_flow = min(c2_base_flow, Config.c2_max_flow)
+        c2_flow = min(c2_base_flow * c2_flow_scale, Config.c2_max_flow)
         c2_power, c2_heat = self.comp_system.compute_c2(
             c2_flow, tank_pressure=t3_avg_pressure, electricity_price=price,
-            cooling_intensity=c2_cool, bypass_bias=bypass_bias)
+            cooling_intensity=c2_load, bypass_bias=bypass_bias)
 
         return (c1_power, c2_power, c1_heat, c2_heat, c1_flow, c2_flow)
-
-    def _compute_fill_factor(self, c1_cool, c2_cool, total_comp_heat):
-        """
-        SAE J2601 充装完成率: 预冷系统与压缩冷却共享制冷回路。
-        废热高 → 预冷不足 → 充装温度偏高 → 自动截断 → 部分充装。
-        动态冷却优化 → 温度平稳 → 充装完整。
-        """
-        heat_load = total_comp_heat / Config.precool_capacity_kw if Config.precool_capacity_kw > 0 else 0.0
-        cooling_quality = (c1_cool + c2_cool) / 2.0 if Config.enable_dynamic_cooling else 0.0
-        ff = (Config.fill_base_rate
-              + Config.fill_cool_bonus * cooling_quality
-              - Config.fill_heat_penalty * heat_load)
-        return float(np.clip(ff, Config.fill_min_rate, 1.0))
 
     def _compute_c3_block(self, c3_flow, avg_sog_700, price, bypass_bias, c3_pressure_bias):
         """
@@ -164,8 +156,8 @@ class HydrogenEnv(gym.Env):
 
         ele_ratio        = np.clip(action[0], 0, 1)
         fc_ratio         = np.clip(action[1], 0, 1)
-        c1_cool          = np.clip(action[2], 0, 1)   # C1 冷却强度 (0=轻度省冷却电, 1=深度省压缩功)
-        c2_cool          = np.clip(action[3], 0, 1)   # C2 冷却强度
+        c1_load          = np.clip(action[2], 0, 1)   # C1 流量×冷却 (0=30%流量+轻冷却, 1=100%流量+深冷却)
+        c2_load          = np.clip(action[3], 0, 1)   # C2 流量×冷却
         c3_pressure_bias = np.clip(action[4], 0, 1)   # C3 APC 偏置 (0=降压, 1=升压)
         bypass_bias      = np.clip(action[5], 0, 1)   # 旁路积极程度
 
@@ -176,14 +168,6 @@ class HydrogenEnv(gym.Env):
         # --- 1. 生成FCEV到达 ---
         fcev_arrivals = self.demand_generator.generate_vehicles(self.current_step)
         self.service_station.add_vehicles(fcev_arrivals)
-
-        # --- FC inventory protection: T3 SOC 低或有排队时抑制 FC 消耗服务库存 ---
-        t3_avg_soc_fc = (self.storage.t3_1.get_soc() + self.storage.t3_2.get_soc() +
-                         self.storage.t3_3.get_soc()) / 3.0
-        queue_len = len(self.service_station.fcev_queue)
-        fc_soc_factor = np.clip((t3_avg_soc_fc - Config.fc_reserve_soc) / 0.15, 0.0, 1.0)
-        fc_queue_factor = np.clip(1.0 - queue_len / 5.0, 0.0, 1.0)
-        fc_ratio *= fc_soc_factor * fc_queue_factor
 
         # --- 2. 制氢 (Electrolyzer -> T1) ---
         current_soc = self.storage.get_total_soc()
@@ -209,7 +193,7 @@ class HydrogenEnv(gym.Env):
         (c1_power, c2_power, c1_heat, c2_heat, c1_flow, c2_flow) = \
             self._compute_comp_block(
                 h2_produced,
-                c1_cool, c2_cool, bypass_bias, c3_pressure_bias, price
+                c1_load, c2_load, bypass_bias, c3_pressure_bias, price
             )
 
         # --- 7. 多储罐系统更新 (统一 Low→High 差压级联) ---
@@ -233,9 +217,6 @@ class HydrogenEnv(gym.Env):
             c3_flow, avg_sog_700, price, bypass_bias, c3_pressure_bias)
 
         total_comp_heat = c1_heat + c2_heat + c3_heat
-
-        # --- 8.5 SAE J2601 充装完成率 (预冷热耦合) ---
-        fill_factor = self._compute_fill_factor(c1_cool, c2_cool, total_comp_heat)
         
         # --- 9. Chiller (固定 0.8 制冷强度) ---
         chiller_power = self.chiller.compute_power(total_comp_heat, chiller_ratio=0.8)
@@ -271,8 +252,7 @@ class HydrogenEnv(gym.Env):
         cost_grid = (power_from_grid * Config.dt + grid_purchase_bus * Config.dt) * price
 
         # 收入来源 (已移除EV收入)
-        # fill_factor: 预冷热耦合 → 部分充装时收入按比例降低
-        revenue_fcev = fcev_revenue * fill_factor
+        revenue_fcev = fcev_revenue  # FCEV加氢收入
         
         # 储能套利奖励 (新增: 鼓励低价制氢、高价放电)
         arbitrage_bonus = 0.0
@@ -345,12 +325,10 @@ class HydrogenEnv(gym.Env):
         #    Profit = FCEV加氢收入 + FC卖电收入 - 购电成本
         step_profit = revenue_fcev + revenue_grid - cost_grid
 
-        # 2. 强化学习奖励 (训练): 以 Profit 为主信号 + 轻量辅助
-        #    v5.0 设计原则: reward ∝ profit, 辅助信号 << profit 幅值
-        #    - throughput_bonus 已移除 (与 revenue_fcev 双重计算 → reward-profit 偏离主因)
-        #    - comp_efficiency_bonus 保留但系数极低 (仅为 VSD/bypass/APC 提供梯度方向)
-        #    - penalty 权重已缩减 (不再主导 reward, 仅作为软约束)
-        step_reward = step_profit + arbitrage_bonus + comp_efficiency_bonus - penalty
+        # 2. 强化学习奖励 (训练): Profit + 套利引导 + 效率引导 + 吞吐激励 - 惩罚
+        #    收益优先级: FCEV(18/12$/kg) >> FC电 >> 压缩效率 >> 套利
+        step_reward = (step_profit + arbitrage_bonus + comp_efficiency_bonus
+                       + throughput_bonus - penalty)
         # =========================================================================
 
         self.current_step += 1
@@ -363,8 +341,8 @@ class HydrogenEnv(gym.Env):
             i2s_penalty = abs(final_soc - init_soc) * Config.i2s_penalty_weight
             step_reward -= i2s_penalty
 
-        # --- 奖励裁剪 (v5.0: 收窄范围，profit-aligned后极端值更少) ---
-        step_reward = np.clip(step_reward, -2000.0, 2000.0)
+        # --- 奖励裁剪，抑制极端值以稳定训练 ---
+        step_reward = np.clip(step_reward, -5000.0, 5000.0)
 
         # --- 更新状态 ---
         self.current_data = self.data_loader.get_step_data(self.current_step)
@@ -433,13 +411,12 @@ class HydrogenEnv(gym.Env):
             "revenue_grid_raw": revenue_grid_raw,
             "cost_grid": cost_grid,
             # 控制动作 (6维)
-            "c1_cool": c1_cool,
-            "c2_cool": c2_cool,
+            "c1_load": c1_load,
+            "c2_load": c2_load,
             "bypass_bias": bypass_bias,
             "c3_pressure_bias": c3_pressure_bias,
             "h2_sold": fcev_h2_demand * supply_ratio,
             # 差压级联统计
-            "fill_factor": fill_factor,
             "c3_booster_flow": c3_flow,
             "avg_sog_350": avg_sog_350,
             "avg_sog_700": avg_sog_700,

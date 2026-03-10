@@ -18,8 +18,9 @@ class Config:
     enable_i2s_constraint = True
 
     # [修改] 降低I2S惩罚权重，避免过度保守
-    # v5.0: 1500→800 — 终端惩罚只需提供回归初始SOC的引导，不应主导reward
-    i2s_penalty_weight = 800.0
+    # 原值10000导致Agent不敢制氢（害怕SOC偏离）
+    # v3.5: 2000→1500 进一步放宽，改善Profit曲线向下趋势
+    i2s_penalty_weight = 1500.0
 
     # --- 物理组件参数 ---
     # 1. 电解槽
@@ -37,11 +38,11 @@ class Config:
     # v3.1: 变速驱动效率曲线 (Variable Speed Drive)
     # 负载率 -> 效率映射
     vsd_efficiency_curve = {
-        0.0: 0.50,   # 空载: 电机仍有损耗
-        0.2: 0.65,   # 20%负载: 变频优势显现
-        0.5: 0.78,   # 50%负载: 显著优于定速(0.75)
-        0.8: 0.82,   # 80%负载: 最优工作点
-        1.0: 0.78    # 满载: 热极限略降效
+        0.0: 0.45,   # 空载效率低
+        0.2: 0.60,   # 20%负载
+        0.5: 0.75,   # 50%负载（额定点）
+        0.8: 0.78,   # 80%负载（最优点）
+        1.0: 0.74    # 满载效率略降
     }
     enable_vsd = True  # 启用变速驱动
     
@@ -85,17 +86,6 @@ class Config:
     c3_output_pressure = 700.0  # bar (FCEV 目标压力)
     c3_max_flow = 15.0  # kg/h
 
-    # SAE J2601 预冷热耦合模型 (Pre-cooling Thermal Coupling)
-    # 物理背景: 加氢站预冷系统(-40°C)与压缩机级间冷却共享制冷回路。
-    # 压缩废热高 → 制冷系统负荷大 → 预冷温度偏高 → SAE J2601 温控限制触发
-    # → 充装自动截断(partial fill) → 实际充入H2质量减少 → 收入降低。
-    # 动态冷却优化(c1_cool/c2_cool) → 温度平稳 → 充装完整率高。
-    precool_capacity_kw = 30.0        # 预冷系统额定制冷功率 (kW)
-    fill_base_rate = 0.60             # 基础充装完成率 (无冷却优化时的基准)
-    fill_cool_bonus = 0.30            # 动态冷却控制对完成率的最大提升
-    fill_heat_penalty = 0.35          # 废热负载每单位对完成率的惩罚
-    fill_min_rate = 0.35              # 最低充装完成率 (SAE J2601 安全下限)
-
     # 3. 多储罐系统 (Multi-Tank Storage System)
     # T1: 缓冲罐 (Electrolyzer output buffer)
     t1_capacity_kg = 100.0  # kg
@@ -130,7 +120,6 @@ class Config:
     # 4. 燃料电池
     fc_max_power = 500.0
     fc_efficiency = 16.0  # kWh/kg
-    fc_reserve_soc = 0.40  # T3 avg SOC 低于此值时抑制 FC (保护 FCEV 服务库存)
 
     # 5. 冷却机 (Chiller - 线性模型)
     chiller_rated_capacity = 500.0  # kW (额定冷却能力)
@@ -259,11 +248,10 @@ class Config:
     price_threshold_high = 0.10  # $/kWh (高电价阈值，高于此值鼓励放电)
     
     # 惩罚参数
-    # v5.0: 惩罚权重对齐原则 — 惩罚 > 对应收益损失 (引导方向)，但 << step_profit (不主导reward)
-    penalty_unmet_h2_demand = 200.0   # $/kg 缺氢惩罚 (> fcev_service_price=18, 但不再 >> step_profit≈145)
+    penalty_unmet_h2_demand = 500.0   # $/kg 缺氢惩罚 (>> fcev_service_price=18, 强制优先供氢)
     penalty_unmet_ev_demand = 150.0   # $/vehicle 无法服务EV惩罚
-    penalty_vehicle_waiting = 10.0    # $/vehicle/hour 等待时间惩罚
-    penalty_fcev_wait = 2.0           # $/vehicle/step 加氢队列等待惩罚
+    penalty_vehicle_waiting = 30.0    # $/vehicle/hour 等待时间惩罚
+    penalty_fcev_wait = 5.0           # $/vehicle/step 加氢队列等待惩罚 (促使agent预备足够T3氢气)
 
     # State 归一化常量
     price_max = 0.20   # $/kWh 电价归一化上限 (数据典型峰值约0.15, 留裕量)
@@ -304,9 +292,9 @@ class Config:
     # 当 actual_kWh_per_kg < comp_eff_ref_kWh_per_kg 时触发正向奖励
     enable_comp_eff_bonus = True   # True=开启压缩效率激励 (推荐 exp2 开启)
     comp_eff_ref_kWh_per_kg = 3.0  # 参考基准能耗 (kWh/kg H2); Naive 基线约在此值附近
-    # v5.0: 3→0.5 仅为 VSD/bypass/APC 维度提供梯度方向，不产生幅值偏离
-    comp_eff_bonus_coef = 0.5      # (↓ from 3; 梯度引导, 不主导reward)
+    # v4.6: 10→3 减小效率激励相对权重，防止 agent 通过降低 c1/c2 流量获取效率奖励而牺牲 T3 备氢量
+    comp_eff_bonus_coef = 3.0      # (↓ from 10)
 
-    # v5.0: 吞吐量激励 → 0 (FCEV服务收益已含在 revenue_fcev → step_profit 中)
-    # 保留此参数用于双重计算会导致 reward↑ 而 profit 不变，是 reward-profit 偏离的主因之一
-    fcev_throughput_bonus = 0.0    # 移除: 避免与 revenue_fcev 双重计算
+    # FCEV 服务吞吐量激励: 直接奖励服务更多车辆 (确保 Smart 不因省电而牺牲服务)
+    # v4.6: 15→30 加强 FCEV 吞吐激励，使其与真实加氢收入 (18$/kg) 更匹配，引导 agent 优先保持 T3 备氢
+    fcev_throughput_bonus = 30.0   # $/vehicle 服务一辆 FCEV 的额外奖励 (↑ from 15)
