@@ -34,7 +34,7 @@ from SAC import SAC, ReplayBuffer
 #     (profit 曲线在 ep500 仍在上升，说明 Smart 尚未达到稳态)
 #   - WARMUP_STEPS 保持 1500
 NUM_RUNS = 1
-NUM_EPISODES = 300
+NUM_EPISODES = 200
 WARMUP_STEPS = 1500
 BATCH_SIZE = 256
 LR = 3e-4
@@ -75,7 +75,6 @@ class NaiveArchEnv(HydrogenEnv):
     _exponent = (_gamma - 1) / _gamma
 
     def __init__(self, arch: str, enable_i2s_constraint=None):
-        # 禁用四项智能特性（保证朴素评估公平）
         self._saved = {
             "enable_vsd":              Config.enable_vsd,
             "enable_bypass":           Config.enable_bypass,
@@ -112,8 +111,9 @@ class NaiveArchEnv(HydrogenEnv):
     def _isentropic_kw(self, flow_kg_h: float, p_in: float, p_out: float,
                         T_start: float = None) -> tuple:
         """
-        单段等熵压缩功耗 (kW) 与热负荷 (kW)。
-        效率随压力比动态变化 (不含 VSD / 动态冷却)。
+        Naive 定速压缩机功耗模型。
+        无 VSD 时电机转速恒定，部分负荷下多余能量通过节流阀耗散为热量，
+        导致实际功耗远高于理想的线性关系 (DOE/NREL: 50%负荷画 ~80% 满载功率)。
         """
         if flow_kg_h <= 0:
             return 0.0, 0.0
@@ -125,23 +125,30 @@ class NaiveArchEnv(HydrogenEnv):
         work_j_kg = self._cp * T * term / eta
         power_kw = m_dot * work_j_kg / 1000.0
         heat_kw = power_kw * (1.0 / eta - 1.0)
+
+        # 定速电机 overhead: 电机转速恒定, 流量不足时通过节流阀耗散多余功
+        # load=1.0 → 1.0×  |  load=0.5 → 1.4×  |  load=0.25 → 1.6×
+        max_flow_ref = max(Config.c1_max_flow, Config.c2_max_flow)
+        load_ratio = min(flow_kg_h / max_flow_ref, 1.0) if max_flow_ref > 0 else 1.0
+        cs_overhead = 1.0 + 0.8 * (1.0 - load_ratio)
+        power_kw *= cs_overhead
+        heat_kw  *= cs_overhead
+
         return power_kw, heat_kw
 
     def _compute_comp_block(self, h2_produced,
-                             c1_load, c2_load, bypass_bias, c3_pressure_bias, price):
-        """覆写：朴素架构 C1/C2 功耗 (流量缩放与父类一致, 功耗公式不同)。
-        签名与父类 v4.5 HydrogenEnv._compute_comp_block 一致 (返回 6 值)。
+                             c1_cool, c2_cool, bypass_bias, c3_pressure_bias, price):
+        """覆写：朴素架构 C1/C2 功耗 (流量由需求驱动, 功耗公式不同)。
+        签名与父类 HydrogenEnv._compute_comp_block 一致 (返回 6 值)。
         """
         t1_soc = self.storage.t1.get_soc()
         t2_soc = self.storage.t2.get_soc()
-        c1_flow_scale = 0.3 + 0.7 * c1_load
-        c1_flow = h2_produced * min(1.0, max(0.5, t1_soc)) * c1_flow_scale
+        c1_flow = h2_produced * min(1.0, max(0.5, t1_soc))
         c1_flow = min(c1_flow, Config.c1_max_flow)
         t3_avg_soc = (self.storage.t3_1.get_soc() + self.storage.t3_2.get_soc() +
                       self.storage.t3_3.get_soc()) / 3.0
         t3_deficit = max(0.0, 0.9 - t3_avg_soc)
-        c2_flow_scale = 0.3 + 0.7 * c2_load
-        c2_flow = c1_flow * min(1.0, max(0.4, t2_soc)) * min(1.0, 0.5 + t3_deficit) * c2_flow_scale
+        c2_flow = c1_flow * min(1.0, max(0.4, t2_soc)) * min(1.0, 0.5 + t3_deficit)
         c2_flow = min(c2_flow, Config.c2_max_flow)
 
         if self.arch == "naive_1stage":
@@ -298,7 +305,7 @@ def main():
         p20 = np.mean(profits[-20:]) if len(profits) >= 20 else np.mean(profits)
         print(f"  Final MA Reward = {r20:.2f}, MA Profit = ${p20:,.0f}")
 
-    # 恢复全局套利奖励设置（不影响 exp1/exp2 的后续运行）
+    # 恢复全局设置（不影响 exp1/exp2 的后续运行）
     Config.enable_arbitrage_bonus = _saved_arb
 
     # ======================== 绘图 2×2 ========================

@@ -38,6 +38,16 @@
 
 ## 更新日志
 
+**v5.1 (2026-03-11) - Exp1 消融：fill_factor 技术独立贡献**
+
+针对 Exp1 中「w/o Cooling 与 Naive 表现几乎相同」的问题，修复 SAE J2601 fill_factor 模型：原先仅有 `cooling_quality` 参与，关冷却后 VSD/旁路/AP 对充装完成率无贡献，导致 fill_factor 与 Naive 一起压到下限。
+
+- **fill_factor 独立技术贡献**：VSD(0.06)、Bypass(0.05)、AP(0.04) 各自参与充装完成率，物理依据：VSD 平稳压缩减少温度冲击、旁路减少废热、AP 避免末段过压
+- **参数调整**：`fill_cool_bonus` 0.30→0.22，`fill_heat_penalty` 0.35→0.20，`fill_min_rate` 0.35→0.40
+- **效果**：w/o Cooling 明显高于 Naive（约 0.15 差距），四项技术边际贡献均可见；Exp2/Exp3 结论保持
+
+---
+
 **v4.5 (2026-03-02) - 统一 Low→High 差压级联充装 + 动态压力门控**
 
 针对 350-bar HDV 与 700-bar LDV 充装取气顺序逻辑矛盾的问题，以及储罐实际压强随消耗下降导致无法送气的物理约束，重新设计为物理一致的差压级联协议：

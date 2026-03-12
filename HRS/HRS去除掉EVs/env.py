@@ -131,13 +131,23 @@ class HydrogenEnv(gym.Env):
     def _compute_fill_factor(self, c1_cool, c2_cool, total_comp_heat):
         """
         SAE J2601 充装完成率: 预冷系统与压缩冷却共享制冷回路。
-        废热高 → 预冷不足 → 充装温度偏高 → 自动截断 → 部分充装。
-        动态冷却优化 → 温度平稳 → 充装完整。
+
+        v5.1: 各项压缩机技术对充装完成率的独立贡献:
+          - VSD  → 压缩过程更平稳, 减少温度尖峰 → SAE J2601 合规性提高
+          - Bypass → 废热减少 → 预冷系统冷却裕量更大
+          - AP   → 精确压力控制 → 避免末段过压缩导致的温度超限
+          - Cooling → 直接控制级间温度 → 充装温度平稳 → 充装完整率最大
         """
         heat_load = total_comp_heat / Config.precool_capacity_kw if Config.precool_capacity_kw > 0 else 0.0
         cooling_quality = (c1_cool + c2_cool) / 2.0 if Config.enable_dynamic_cooling else 0.0
+
+        vsd_bonus = Config.fill_vsd_bonus if Config.enable_vsd else 0.0
+        bypass_bonus = Config.fill_bypass_bonus if Config.enable_bypass else 0.0
+        ap_bonus = Config.fill_ap_bonus if Config.enable_adaptive_pressure else 0.0
+
         ff = (Config.fill_base_rate
               + Config.fill_cool_bonus * cooling_quality
+              + vsd_bonus + bypass_bonus + ap_bonus
               - Config.fill_heat_penalty * heat_load)
         return float(np.clip(ff, Config.fill_min_rate, 1.0))
 

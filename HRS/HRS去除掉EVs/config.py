@@ -90,11 +90,20 @@ class Config:
     # 压缩废热高 → 制冷系统负荷大 → 预冷温度偏高 → SAE J2601 温控限制触发
     # → 充装自动截断(partial fill) → 实际充入H2质量减少 → 收入降低。
     # 动态冷却优化(c1_cool/c2_cool) → 温度平稳 → 充装完整率高。
+    #
+    # v5.1 重构: 各项技术对 fill_factor 的独立贡献
+    #   - VSD: 变速驱动 → 压缩过程更平稳 → 减少温度尖峰 → SAE J2601 合规性↑
+    #   - Bypass: 旁路跳过不必要压缩 → 废热减少 → 预冷系统裕量更大
+    #   - AP: 自适应压力 → 避免末段过压缩 → 温度平稳 → 充装截断风险↓
+    #   - Cooling: 动态级间冷却 → 直接控制压缩出口温度 → 充装完整率最大
     precool_capacity_kw = 30.0        # 预冷系统额定制冷功率 (kW)
-    fill_base_rate = 0.60             # 基础充装完成率 (无冷却优化时的基准)
-    fill_cool_bonus = 0.30            # 动态冷却控制对完成率的最大提升
-    fill_heat_penalty = 0.35          # 废热负载每单位对完成率的惩罚
-    fill_min_rate = 0.35              # 最低充装完成率 (SAE J2601 安全下限)
+    fill_base_rate = 0.60             # 基础充装完成率 (无任何技术优化时的基准)
+    fill_cool_bonus = 0.22            # 动态冷却控制对完成率的最大提升 (↓ from 0.30)
+    fill_vsd_bonus = 0.06             # VSD: 平稳压缩 → 减少温度冲击
+    fill_bypass_bonus = 0.05          # Bypass: 减少废热 → 预冷裕量↑
+    fill_ap_bonus = 0.04              # AP: 精确压力控制 → 避免末端温度尖峰
+    fill_heat_penalty = 0.20          # 废热负载每单位对完成率的惩罚 (↓ from 0.35)
+    fill_min_rate = 0.40              # 最低充装完成率 (SAE J2601 安全下限, ↑ from 0.35)
 
     # 3. 多储罐系统 (Multi-Tank Storage System)
     # T1: 缓冲罐 (Electrolyzer output buffer)

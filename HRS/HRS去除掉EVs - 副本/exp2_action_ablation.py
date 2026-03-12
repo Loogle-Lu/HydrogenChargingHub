@@ -5,15 +5,16 @@
 突出压缩机智能控制的边际贡献。
 (环境已移除 EV，State 11D，Action 6D)
 
-- Full 6D: [ele, fc, c1_load, c2_load, c3_pressure_bias, bypass_bias]
-    c1_load/c2_load 同时控制流量缩放(30%-100%)和冷却强度
-    RL Agent 可学习「低电价全速压缩, 高电价减速」时序套利策略
-- Naive Always-Full-Power 2D: [ele, fc], 压缩机固定全速
-  [c1_load=1.0, c2_load=1.0, c3_pressure_bias=0.5, bypass_bias=0.0]
-  代表「工业常规：24h 全速运行, 无智能控制」Baseline:
-    - c1_load=c2_load=1.0: 100%流量+深冷却 (不区分电价, 一视同仁)
-    - bypass_bias=0.0: 从不旁路
-    - c3_pressure_bias=0.5: C3 APC 默认
+- Full 6D: [ele, fc, c1_cool, c2_cool, c3_pressure_bias, bypass_bias]
+    c1_cool/c2_cool 控制级间冷却强度 (0=轻度省冷却电, 1=深度省压缩功)
+    流量由储罐需求自动驱动, RL Agent 可学习「低电价深冷却, 高电价轻冷却」策略
+- Naive Max Power 2D: [ele, fc], 压缩机固定最大功率参数
+  [c1_cool=0.0, c2_cool=0.0, c3_pressure_bias=1.0, bypass_bias=0.0]
+  代表「工业常规: 无智能冷却/旁路/APC, 固定最大功率运行」Baseline:
+    - c1_cool=c2_cool=0.0: 无级间深度冷却 → 压缩出口温度高 → 功耗大
+    - c3_pressure_bias=1.0: 始终最大压力输出 → C3 功耗浪费
+    - bypass_bias=0.0: 从不旁路 → 无法跳过不必要的压缩
+  + 固定控制 → 温控不稳 → SAE J2601 合规性降低 → 保守充装 → 有效吞吐降低
 
 输出:
 - 图: Reward/Profit 柱状图(含误差棒) | Reward/Profit 曲线 | Compressor/Chiller/Bypass 指标
@@ -32,17 +33,19 @@ from config import Config
 
 # ======================== 配置 ========================
 NUM_RUNS = 1  # 增加 run 数以计算误差棒
-NUM_EPISODES = 500  # 6D 搜索空间，需要足够步骤收敛
+NUM_EPISODES = 200  # 6D 搜索空间，需要足够步骤收敛
 WARMUP_STEPS = 400
 BATCH_SIZE = 256
 LR = 3e-4
 MA_WINDOW = 20
 
-# Naive 固定压缩机动作 (c1_load, c2_load, c3_pressure_bias, bypass_bias)
-# [1.0, 1.0, 0.5, 0.0] = 全速压缩(不区分电价) / 默认C3 / 无旁路
-# 代表「工业常规：24h 全速运行」的 Baseline
-# RL Agent 应学会在高电价时段降低 c_load 以节省电费 (时序套利)
-FIXED_COMPRESSOR_ACTIONS = [1.0, 1.0, 0.5, 0.0]
+# Naive 固定压缩机参数 (c1_cool, c2_cool, c3_pressure_bias, bypass_bias)
+# [0.0, 0.0, 1.0, 0.0] = 无动态冷却 / 最大C3输出压力 / 无旁路
+# 代表「工业常规: 固定最大参数运行, 无智能控制」的 Baseline
+# c1/c2_cool=0: 不进行级间深度冷却 → 压缩功耗高
+# c3_pressure_bias=1.0: 始终压缩至最大压力 → C3 功耗浪费
+# bypass_bias=0.0: 从不旁路 → 无法跳过不必要的压缩
+FIXED_COMPRESSOR_ACTIONS = [0.0, 0.0, 1.0, 0.0]
 
 
 class FixedCompressorActionWrapper(gym.ActionWrapper):
@@ -65,8 +68,8 @@ class FixedCompressorActionWrapper(gym.ActionWrapper):
         # 映射到 6 维: [ele, fc, c1_cool, c2_cool, c3_pressure_bias, bypass_bias]
         full = np.array([
             a[0], a[1],           # ele, fc
-            self.fixed[0],        # c1_load
-            self.fixed[1],        # c2_load
+            self.fixed[0],        # c1_cool
+            self.fixed[1],        # c2_cool
             self.fixed[2],        # c3_pressure_bias
             self.fixed[3],        # bypass_bias
         ], dtype=np.float32)
@@ -231,7 +234,7 @@ def main():
     print("  实验2: 动作空间消融 (Full 6D vs Naive Max Power 2D)")
     print("=" * 60)
     print(f"  Runs: {NUM_RUNS}, Episodes: {NUM_EPISODES}")
-    print(f"  Naive Baseline: c1_load={FIXED_COMPRESSOR_ACTIONS[0]}, c2_load={FIXED_COMPRESSOR_ACTIONS[1]}, "
+    print(f"  Naive Baseline: c1_cool={FIXED_COMPRESSOR_ACTIONS[0]}, c2_cool={FIXED_COMPRESSOR_ACTIONS[1]}, "
           f"c3_pressure={FIXED_COMPRESSOR_ACTIONS[2]}, bypass={FIXED_COMPRESSOR_ACTIONS[3]}")
     print("=" * 60)
 
