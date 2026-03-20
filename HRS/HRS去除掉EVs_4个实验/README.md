@@ -38,6 +38,31 @@
 
 ## 更新日志
 
+**v5.2 (2026-03-17) - Exp4 三维场景鲁棒性：K-Medoids 3×3×3 聚类**
+
+- **data_loader 电价噪声**：base_price 96 步平铺 365 天 + 高斯白噪声 N(0, 0.03)（与 plot_data.py 一致），`price_days` (365×96) 取代单日电价；`reset()` 随机选天，每 episode 电价不同
+- **三维 K-Medoids 场景提取**：
+  - **电价**：365 天价格日 → 特征 (日均价, 峰谷价差) → K=3 → Low / Med / High Price
+  - **可再生能源**：PV(100天)×Wind(150天) 采样 2000 组合 → 特征 (PV kWh, Wind kWh) → K=3 → Low / Med / High RE
+  - **FCEV 需求**：到达率 Uniform[4,18] 蒙特卡洛模拟 1000 天 → 特征 (日总到达, 峰值到达) → K=3 → Low / Med / High Demand
+- **3×3×3 = 27 个场景**：每场景重训练 SAC，Proposed / w/o RL / w/o 4T / w/o CC 四种配置，验证 CC + 4T + RL 在多情形下稳定优于 baseline
+- **输出 7 张图**：
+  - `Figure_4.0a/b/c_clustering_*.png`（电价 / RE / 需求 聚类散点）
+  - `Figure_4.1a/b/c_grid_*.png`（Low / Med / High Price 各一张 3×3 柱状图）
+  - `Figure_4.2_scenario_heatmap.png`（三面板热力图, 4 方案 × 27 场景）
+
+---
+
+**v5.1 (2026-03-11) - Exp1 消融：fill_factor 技术独立贡献**
+
+针对 Exp1 中「w/o Cooling 与 Naive 表现几乎相同」的问题，修复 SAE J2601 fill_factor 模型：原先仅有 `cooling_quality` 参与，关冷却后 VSD/旁路/AP 对充装完成率无贡献，导致 fill_factor 与 Naive 一起压到下限。
+
+- **fill_factor 独立技术贡献**：VSD(0.06)、Bypass(0.05)、AP(0.04) 各自参与充装完成率，物理依据：VSD 平稳压缩减少温度冲击、旁路减少废热、AP 避免末段过压
+- **参数调整**：`fill_cool_bonus` 0.30→0.22，`fill_heat_penalty` 0.35→0.20，`fill_min_rate` 0.35→0.40
+- **效果**：w/o Cooling 明显高于 Naive（约 0.15 差距），四项技术边际贡献均可见；Exp2/Exp3 结论保持
+
+---
+
 **v4.5 (2026-03-02) - 统一 Low→High 差压级联充装 + 动态压力门控**
 
 针对 350-bar HDV 与 700-bar LDV 充装取气顺序逻辑矛盾的问题，以及储罐实际压强随消耗下降导致无法送气的物理约束，重新设计为物理一致的差压级联协议：
