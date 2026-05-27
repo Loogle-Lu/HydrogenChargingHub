@@ -1,0 +1,328 @@
+import numpy as np
+import os
+
+
+class Config:
+    # --- 路径配置 (使用 r 前缀处理 Windows 路径) ---
+    # 请确保这些路径指向你的实际文件位置
+    path_price = r"E:\桌面图标\Graduation Thesis\Hydrogen\HydrogenChargingHub\price_after_MAD_96.pkl"
+    path_pv = r"E:\桌面图标\Graduation Thesis\Hydrogen\HydrogenChargingHub\pv_power_100.pkl"
+    path_wind = r"E:\桌面图标\Graduation Thesis\Hydrogen\HydrogenChargingHub\wd_power_150.pkl"
+
+    # --- 全局模拟参数 ---
+    dt = 0.25  # 15分钟一个点 (0.25小时)
+    steps_per_day = 96
+    episode_length = 96  # 训练一个回合代表一天
+
+    # --- I2S (Identical Initial State) 约束参数 ---
+    enable_i2s_constraint = True
+
+    # [修改] 降低I2S惩罚权重，避免过度保守
+    # v5.0: 1500→800 — 终端惩罚只需提供回归初始SOC的引导，不应主导reward
+    i2s_penalty_weight = 800.0
+
+    # --- 物理组件参数 ---
+    # 1. 电解槽
+    ele_max_power = 1000.0  # kW
+    ele_efficiency = 50.0  # kWh/kg
+    
+    # 2. 多级级联压缩机系统 (Multi-Stage Cascade Compressor System)
+    # 公共压缩机参数
+    comp_efficiency = 0.75  # 额定效率（50%负载）
+    H2_gamma = 1.41
+    H2_R = 4124.0  # J/(kg·K)
+    H2_molar_mass = 2.016
+    T_in = 298.15  # K
+    
+    # v3.1: 变速驱动效率曲线 (Variable Speed Drive)
+    # 负载率 -> 效率映射
+    vsd_efficiency_curve = {
+        0.0: 0.50,   # 空载: 电机仍有损耗
+        0.2: 0.65,   # 20%负载: 变频优势显现
+        0.5: 0.78,   # 50%负载: 显著优于定速(0.75)
+        0.8: 0.82,   # 80%负载: 最优工作点
+        1.0: 0.78    # 满载: 热极限略降效
+    }
+    enable_vsd = True  # 启用变速驱动
+    
+    # v5.3: 智能旁路控制 (Intelligent Bypass Control, IBC)
+    # 物理判据: 上游罐压 > 下游罐压 (正压差) 且 压差 ≥ min_dp 且 流量小
+    enable_bypass = True
+    bypass_min_dp_conservative = 15.0  # bar (bypass_bias=0: 保守, 需大压差)
+    bypass_min_dp_aggressive = 2.0     # bar (bypass_bias=1: 积极, 小压差即可)
+    bypass_demand_threshold = 5.0      # kg/h, 流量低于此值时才允许旁路
+    
+    # v3.1: 动态级间冷却 (Dynamic Intercooling)
+    enable_dynamic_cooling = True  # 启用动态冷却
+    min_intercool_temp = 293.15  # K (20°C) 深度冷却 (必须 < T_in=298.15K)
+    max_intercool_temp = 313.15  # K (40°C) 轻度冷却
+    no_cooling_intercool_temp = 313.15  # K 无动态冷却时回退到最高温度(最差工况)
+    cooling_price_threshold = 0.10  # $/kWh 高于此电价则轻度冷却
+    
+    # v3.1/v6.0: 压力自适应控制 (Adaptive Pressure, APC)
+    # C3 输入始终为 T3₃ (500 bar)
+    # v6.0 三级判定: ① 查表+DRL缩放 → ② SAE J2601 护栏(≥车内压+50bar) → ③ 设备上限(850bar)
+    # 高 SOC 时适当降低 C3 出口压力以节省压缩功，但不低于 SAE 安全底线
+    enable_adaptive_pressure = True
+    adaptive_pressure_map = {
+        0.0: 700,   # SOC 0-70%: 700 bar 快速充装
+        0.7: 700,
+        0.8: 600,   # SOC 70-80%: 600 bar 减少过压缩
+        0.9: 550,   # SOC 80-90%: 550 bar
+        1.0: 500    # SOC 90%+:  500 bar 近似直出 T3₃
+    }
+    
+    # C1: 第一级压缩机 (Electrolyzer output -> T2)
+    c1_input_pressure = 2.0  # bar (T1压力)
+    c1_output_pressure = 35.0  # bar (T2压力)
+    c1_max_flow = 20.0  # kg/h
+    
+    # C2: 第二级级联压缩机 (T2 -> T3 cascaded subsystem)
+    c2_input_pressure = 35.0  # bar
+    c2_output_pressure = 500.0  # bar (填充T3₁, T3₂, T3₃)
+    c2_max_flow = 20.0  # kg/h
+    
+    # C3: 第三级压缩机 (T3 差压级联 -> FCEV 直充, 无 T4 缓冲罐)
+    # 从 T3 组最高压储罐取气，在线压缩后直接送 FCEV 加氢机
+    c3_input_pressure = 500.0  # bar (T3₃最高压)
+    c3_output_pressure = 850.0  # bar (v6.0: 物理天花板 700→850, SAE J2601 合规)
+    c3_max_flow = 15.0  # kg/h
+    
+    # v6.0: SAE J2601 rapid fueling protocol 最小压差
+    # C3 排气压力必须 ≥ 当前 FCEV 车内压力 + 此值，保证加氢不断供
+    sae_j2601_min_pressure_diff = 50.0  # bar
+
+    # SAE J2601 预冷热耦合模型 (Pre-cooling Thermal Coupling)
+    # 物理背景: 加氢站预冷系统(-40°C)与压缩机级间冷却共享制冷回路。
+    # 压缩废热高 → 制冷系统负荷大 → 预冷温度偏高 → SAE J2601 温控限制触发
+    # → 充装自动截断(partial fill) → 实际充入H2质量减少 → 收入降低。
+    # 动态冷却优化(c1_cool/c2_cool) → 温度平稳 → 充装完整率高。
+    #
+    # v5.1 重构: 各项技术对 fill_factor 的独立贡献
+    #   - VSD: 变速驱动 → 压缩过程更平稳 → 减少温度尖峰 → SAE J2601 合规性↑
+    #   - Bypass: 旁路跳过不必要压缩 → 废热减少 → 预冷系统裕量更大
+    #   - AP: 自适应压力 → 避免末段过压缩 → 温度平稳 → 充装截断风险↓
+    #   - Cooling: 动态级间冷却 → 直接控制压缩出口温度 → 充装完整率最大
+    precool_capacity_kw = 30.0        # 预冷系统额定制冷功率 (kW)
+    fill_base_rate = 0.60             # 基础充装完成率 (无任何技术优化时的基准)
+    fill_cool_bonus = 0.22            # 动态冷却控制对完成率的最大提升 (↓ from 0.30)
+    fill_vsd_bonus = 0.06             # VSD: 平稳压缩 → 减少温度冲击
+    fill_bypass_bonus = 0.05          # Bypass: 减少废热 → 预冷裕量↑
+    fill_ap_bonus = 0.04              # AP: 精确压力控制 → 避免末端温度尖峰
+    fill_heat_penalty = 0.20          # 废热负载每单位对完成率的惩罚 (↓ from 0.35)
+    fill_min_rate = 0.40              # 最低充装完成率 (SAE J2601 安全下限, ↑ from 0.35)
+
+    # 3. 多储罐系统 (Multi-Tank Storage System)
+    # T1: 缓冲罐 (Electrolyzer output buffer)
+    t1_capacity_kg = 100.0  # kg
+    t1_max_pressure = 2.0  # barg
+    t1_initial_soc = 0.5
+    
+    # T2: 中压储罐
+    t2_capacity_kg = 200.0  # kg
+    t2_max_pressure = 35.0  # barg
+    t2_initial_soc = 0.5
+    
+    # T3: 差压级联储罐组 (Differential-Pressure Cascade)
+    # T3₁(低压)→T3₂(中压)→T3₃(高压) 依次向 FCEV 充装，压差驱动
+    t3_1_capacity_kg = 120.0  # kg
+    t3_2_capacity_kg = 120.0  # kg
+    t3_3_capacity_kg = 120.0  # kg
+    t3_1_max_pressure = 200.0  # barg (低压，FCEV 高 SOC 阶段使用)
+    t3_2_max_pressure = 350.0  # barg (中压)
+    t3_3_max_pressure = 500.0  # barg (高压，FCEV 低 SOC 阶段优先)
+    t3_initial_soc = 0.5
+    
+    # 差压级联充装最低压差 (bar): 储罐实际压强须超过车辆背压至少此值才能送气
+    min_cascade_pressure_diff = 5.0
+    
+    # T4: 已移除 (C3 直充取代 T4 缓冲罐，简化拓扑，在线压缩)
+    
+    # 储罐通用参数
+    storage_min_level = 0.05
+    storage_max_level = 0.95
+    storage_initial = 0.5  # I2S 目标 SOC (用于总系统)
+
+    # 4. 燃料电池
+    fc_max_power = 500.0
+    fc_efficiency = 16.0  # kWh/kg
+    fc_reserve_soc = 0.40  # T3 avg SOC 低于此值时抑制 FC (保护 FCEV 服务库存)
+
+    # 5. 冷却机 (Chiller - 线性模型)
+    chiller_rated_capacity = 500.0  # kW (额定冷却能力)
+    chiller_rated_cop = 3.5  # 固定COP
+    
+    # 热力学参数
+    target_temp = 298.15  # K (冷却目标温度)
+
+    # 6. FCEV加氢需求参数 (基于SAE J2601协议)
+    # Hyundai Nexo规格 (参考图片)
+    fcev_tank_capacity = 6.3  # kg H2
+    fcev_tank_volume = 156.0  # L
+    fcev_target_pressure = 700.0  # bar
+    fcev_min_pressure = 350.0  # bar (最低充装压力)
+    
+    # 加氢时间和速率 (SAE J2601)
+    fcev_target_fill_time = 4.0  # minutes (3-5分钟目标)
+    fcev_min_fill_time = 3.0  # minutes
+    fcev_max_fill_time = 5.0  # minutes
+    
+    # 压力爬升率 (APRR - Average Pressure Ramp Rate)
+    fcev_aprr_target = 10.0  # bar/min
+    fcev_max_pressure_ramp = 15.0  # bar/min (最大爬升率)
+    
+    # 到站状态分布
+    fcev_soc_arrival_mean = 0.20  # State of Charge (SOC)平均20% (低渗透率，充装需求高)
+    fcev_soc_arrival_std = 0.10
+    fcev_soc_target = 0.95  # 目标充装到95%
+    
+    # 加氢服务价格 (卖氢收益 >> 卖电给电网，引导智能体优先满足FCEV)
+    fcev_service_price = 18.0       # $/kg 700-bar 乘用车 (高压快充溢价)
+    fcev_350bar_ratio = 0.3         # 30% FCEV 为 350-bar 车型 (公交/卡车)
+    fcev_350bar_service_price = 12.0  # $/kg 350-bar 车型服务价格
+    
+    # 7. EV充电需求参数
+    # 典型EV规格 (20% SOC初始 -> 80% SOC快充策略)
+    ev_battery_capacity_mean = 65.0  # kWh (平均电池容量)
+    ev_battery_capacity_std = 15.0  # kWh (标准差，考虑不同车型)
+    
+    # 充电功率
+    ev_fast_charge_power = 150.0  # kW (DC快充)
+    ev_slow_charge_power = 11.0  # kW (AC慢充 Level 2)
+    ev_ultra_fast_charge_power = 350.0  # kW (超快充，如Tesla V3)
+    
+    # 充电时间特性
+    ev_fast_charge_time = 0.5  # hours (30分钟快充策略: 20%->80%)
+    ev_slow_charge_time = 6.0  # hours (慢充完全充满)
+    
+    # 到站状态分布
+    ev_soc_arrival_mean = 0.25  # 平均到站SOC 25%
+    ev_soc_arrival_std = 0.12
+    ev_soc_target_fast = 0.80  # 快充目标80% (保护电池)
+    ev_soc_target_slow = 0.95  # 慢充目标95%
+    
+    # EV充电服务价格 (需保证 氢转电利润 > 电网购电卖EV 才有意义)
+    # 氢转电: 1 kg H2→16 kWh, 成本≈制氢电费; 电网: 购价=电价
+    # 合理区间: 0.35~0.45 $/kWh
+    ev_service_price = 0.40  # $/kWh (含服务费，略高以体现氢转电优势)
+    
+    # 8. 混合需求场景参数 (EV + FCEV)
+    # 车辆到达率模型
+    base_vehicle_arrival_rate = 10.0  # vehicles/hour (基准)
+    ev_fcev_ratio = 0.70  # EV占70%, FCEV占30% (当前市场渗透率)
+    
+    # 充电模式分布 (EV)
+    ev_fast_charge_ratio = 0.75  # 75%选择快充
+    ev_slow_charge_ratio = 0.20  # 20%慢充
+    ev_ultra_fast_ratio = 0.05  # 5%超快充
+    
+    # 时段系数 (模拟一天的需求曲线)
+    # 高峰期: 早7-9AM (通勤), 晚5-7PM (下班)
+    # 午间: 12-2PM (中度)
+    # 深夜: 11PM-6AM (低谷)
+    peak_morning_hours = [7, 8]
+    peak_evening_hours = [17, 18]
+    midday_hours = [12, 13]
+    offpeak_hours = [0, 1, 2, 3, 4, 5, 22, 23]
+    
+    peak_arrival_multiplier = 2.8  # 高峰期到达率倍数
+    midday_multiplier = 1.5
+    offpeak_multiplier = 0.3
+    
+    # 9. 需求响应 (Demand Response) 能力
+    enable_demand_response = True
+    
+    # 电价阈值
+    dr_price_threshold_high = 0.12  # $/kWh (高电价)
+    dr_price_threshold_low = 0.04  # $/kWh (低电价)
+    
+    # EV需求响应灵活性 (图片显示EV可参与DR)
+    ev_dr_flexibility_fast = 0.30  # 快充30%可延迟
+    ev_dr_flexibility_slow = 0.60  # 慢充60%可延迟
+    ev_max_delay_hours = 2.0  # 最大延迟2小时
+    
+    # FCEV需求响应灵活性 (图片显示FCEV难以参与DR，加氢时间短)
+    fcev_dr_flexibility = 0.05  # 仅5%可短暂延迟
+    fcev_max_delay_minutes = 10.0  # 最大延迟10分钟
+    
+    # 10. 加氢站容量约束 (基于级联储罐系统)
+    # 同时服务能力
+    max_concurrent_fcev = 3  # 最多同时加氢3辆FCEV (D1/D2/D3)
+    max_concurrent_ev_fast = 4  # 快充桩数量
+    max_concurrent_ev_slow = 8  # 慢充桩数量
+    
+    # 11. 经济参数 (卖氢 >> 卖电，EV优先氢转电，氢转电利润 > 电网购电卖EV)
+    hydrogen_price = 10.0  # $/kg (制氢成本参考)
+    electricity_price_sell_coef = 1.0
+    
+    # --- v4.0: 电网售电模式 (卖电给地电网) ---
+    # grid_export_mode: "zero_export" | "local_grid"
+    #   - zero_export: 多余电弃电，不产生收益
+    #   - local_grid: 多余电可卖给地方电网，收购价低于零售价
+    grid_export_mode = "local_grid"
+    local_grid_feedin_ratio = 0.42  # 地电网收购价低，卖氢收益 >> 卖电收益
+    # 防"只卖电不卖氢"策略漏洞: 售电收入计入Profit的上限 = 服务收入(EV+FCEV) × 此比例
+    max_grid_revenue_ratio = 0.35  # 售电收入不超过服务收入的35%，强化卖氢主导
+    
+    # 储能套利激励参数 (新增)
+    enable_arbitrage_bonus = True  # 启用储能套利奖励
+    # v4.6: 50→10 大幅降低套利奖励权重，避免 agent 为套利消耗 T3 氢气而牺牲 FCEV 服务收入
+    # 背景: arbitrage_bonus 峰值可达 ~10,000/step，远超 step_profit ~115/step；
+    #       这导致 Smart agent 优化套利而非 profit，使 3-Stage Smart 的 Profit 低于 3-Stage Naive
+    arbitrage_bonus_coef = 10.0  # 套利奖励系数 (↓ from 50)
+    soc_health_bonus = 5.0   # SOC在[0.4,0.6]时的健康奖励 (↓ from 20；避免与高 T3 SOC 目标冲突)
+    price_threshold_low = 0.06  # $/kWh (低电价阈值，低于此值鼓励制氢)
+    price_threshold_high = 0.10  # $/kWh (高电价阈值，高于此值鼓励放电)
+    
+    # 惩罚参数
+    # v5.0: 惩罚权重对齐原则 — 惩罚 > 对应收益损失 (引导方向)，但 << step_profit (不主导reward)
+    penalty_unmet_h2_demand = 200.0   # $/kg 缺氢惩罚 (> fcev_service_price=18, 但不再 >> step_profit≈145)
+    penalty_unmet_ev_demand = 150.0   # $/vehicle 无法服务EV惩罚
+    penalty_vehicle_waiting = 10.0    # $/vehicle/hour 等待时间惩罚
+    penalty_fcev_wait = 2.0           # $/vehicle/step 加氢队列等待惩罚
+
+    # State 归一化常量
+    price_max = 0.20   # $/kWh 电价归一化上限 (数据典型峰值约0.15, 留裕量)
+    queue_max = 5.0    # 辆 FCEV 队列归一化上限 (每种车型)
+    
+    # 12. 电池储能系统 (Battery Energy Storage System, BESS) - v2.6新增
+    # 核心参数
+    battery_capacity = 500.0  # kWh (储能容量，约相当于8辆EV电池)
+    battery_max_charge_power = 250.0  # kW (最大充电功率，C-rate=0.5)
+    battery_max_discharge_power = 250.0  # kW (最大放电功率，C-rate=0.5)
+    
+    # 效率参数
+    battery_charge_efficiency = 0.95  # 充电效率 (典型锂电池)
+    battery_discharge_efficiency = 0.95  # 放电效率
+    # 往返效率 = 0.95 × 0.95 = 90.25% (远高于氢储能的30-40%)
+    
+    # SOC约束
+    battery_min_soc = 0.10  # 最小SOC (保护电池寿命)
+    battery_max_soc = 0.90  # 最大SOC (保护电池寿命)
+    battery_initial_soc = 0.50  # 初始SOC
+    
+    # 寿命参数
+    battery_lifetime_cycles = 5000  # 循环寿命 (80% DOD)
+    battery_degradation_cost = 0.05  # $/kWh (折旧成本)
+    
+    # 电池储能策略
+    enable_battery_storage = False  # 已移除BESS；EV充电来自 绿色能源+电网+H2转电
+    battery_priority_threshold = 100.0  # kW (保留供BatteryEnergyStorage类引用)
+    
+    # 协同策略 (电池 vs 氢储能)
+    # - 电池: 短时调峰 (秒-分钟)，高效率，快响应
+    # - 氢气: 长时储能 (小时-天)，大容量，低效率
+    # - 协同: 电池削峰填谷，氢气季节调节
+
+    # 13. 压缩机效率激励 (Compressor Efficiency Bonus)
+    # 显式奖励 RL Agent 降低单位氢气压缩能耗，使 7D 动作空间中的压缩机控制维度有更强的梯度信号
+    # 参考值: Naive Max Power [1.0, 0.0, 0.0] 约等效于 3.0 kWh/kg
+    # 当 actual_kWh_per_kg < comp_eff_ref_kWh_per_kg 时触发正向奖励
+    enable_comp_eff_bonus = True   # True=开启压缩效率激励 (推荐 exp2 开启)
+    comp_eff_ref_kWh_per_kg = 3.0  # 参考基准能耗 (kWh/kg H2); Naive 基线约在此值附近
+    # v5.0: 3→0.5 仅为 VSD/bypass/APC 维度提供梯度方向，不产生幅值偏离
+    comp_eff_bonus_coef = 0.5      # (↓ from 3; 梯度引导, 不主导reward)
+
+    # v5.0: 吞吐量激励 → 0 (FCEV服务收益已含在 revenue_fcev → step_profit 中)
+    # 保留此参数用于双重计算会导致 reward↑ 而 profit 不变，是 reward-profit 偏离的主因之一
+    fcev_throughput_bonus = 0.0    # 移除: 避免与 revenue_fcev 双重计算

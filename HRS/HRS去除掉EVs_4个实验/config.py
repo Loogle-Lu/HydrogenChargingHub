@@ -45,10 +45,12 @@ class Config:
     }
     enable_vsd = True  # 启用变速驱动
     
-    # v3.1: 智能旁路控制 (Intelligent Bypass)
-    enable_bypass = True  # 启用旁路控制
-    bypass_pressure_threshold = 0.8  # 储罐压力>目标压力80%时可旁路
-    bypass_demand_threshold = 5.0  # kg/h，需求低于此值时考虑旁路
+    # v5.3: 智能旁路控制 (Intelligent Bypass Control, IBC)
+    # 物理判据: 上游罐压 > 下游罐压 (正压差) 且 压差 ≥ min_dp 且 流量小
+    enable_bypass = True
+    bypass_min_dp_conservative = 15.0  # bar (bypass_bias=0: 保守, 需大压差)
+    bypass_min_dp_aggressive = 2.0     # bar (bypass_bias=1: 积极, 小压差即可)
+    bypass_demand_threshold = 5.0      # kg/h, 流量低于此值时才允许旁路
     
     # v3.1: 动态级间冷却 (Dynamic Intercooling)
     enable_dynamic_cooling = True  # 启用动态冷却
@@ -59,14 +61,14 @@ class Config:
     
     # v3.1: 压力自适应控制 (Adaptive Pressure, APC)
     # C3 输入始终为 T3₃ (500 bar)，因此 APC 输出必须 ≥ 500 bar
-    # 高 SOG 时适当降低 C3 出口压力以节省压缩功
+    # 高 SOC 时适当降低 C3 出口压力以节省压缩功
     enable_adaptive_pressure = True
     adaptive_pressure_map = {
-        0.0: 700,   # SOG 0-70%: 700 bar 快速充装
+        0.0: 700,   # SOC 0-70%: 700 bar 快速充装
         0.7: 700,
-        0.8: 600,   # SOG 70-80%: 600 bar 减少过压缩
-        0.9: 550,   # SOG 80-90%: 550 bar
-        1.0: 500    # SOG 90%+:  500 bar 近似直出 T3₃
+        0.8: 600,   # SOC 70-80%: 600 bar 减少过压缩
+        0.9: 550,   # SOC 80-90%: 550 bar
+        1.0: 500    # SOC 90%+:  500 bar 近似直出 T3₃
     }
     
     # C1: 第一级压缩机 (Electrolyzer output -> T2)
@@ -121,9 +123,9 @@ class Config:
     t3_1_capacity_kg = 120.0  # kg
     t3_2_capacity_kg = 120.0  # kg
     t3_3_capacity_kg = 120.0  # kg
-    t3_1_max_pressure = 200.0  # barg (低压，FCEV 高 SOG 阶段使用)
+    t3_1_max_pressure = 200.0  # barg (低压，FCEV 高 SOC 阶段使用)
     t3_2_max_pressure = 350.0  # barg (中压)
-    t3_3_max_pressure = 500.0  # barg (高压，FCEV 低 SOG 阶段优先)
+    t3_3_max_pressure = 500.0  # barg (高压，FCEV 低 SOC 阶段优先)
     t3_initial_soc = 0.5
     
     # 差压级联充装最低压差 (bar): 储罐实际压强须超过车辆背压至少此值才能送气
@@ -165,9 +167,9 @@ class Config:
     fcev_max_pressure_ramp = 15.0  # bar/min (最大爬升率)
     
     # 到站状态分布
-    fcev_sog_arrival_mean = 0.20  # State of Gas平均20% (低渗透率，充装需求高)
-    fcev_sog_arrival_std = 0.10
-    fcev_sog_target = 0.95  # 目标充装到95%
+    fcev_soc_arrival_mean = 0.20  # State of Charge (SOC)平均20% (低渗透率，充装需求高)
+    fcev_soc_arrival_std = 0.10
+    fcev_soc_target = 0.95  # 目标充装到95%
     
     # 加氢服务价格 (卖氢收益 >> 卖电给电网，引导智能体优先满足FCEV)
     fcev_service_price = 18.0       # $/kg 700-bar 乘用车 (高压快充溢价)

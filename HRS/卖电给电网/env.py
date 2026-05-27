@@ -86,7 +86,7 @@ class HydrogenEnv(gym.Env):
                            self.storage.t3_3.max_pressure * self.storage.t3_3.get_soc()) / 3.0
         # C3 在线取气: 以 T3₃ (500 bar) 作为 C3 入口压力参考，无 T4
         t3_3_pressure = self.storage.t3_3.max_pressure * self.storage.t3_3.get_soc()
-        avg_fcev_sog = self.service_station.current_fcev_avg_sog
+        avg_fcev_soc = self.service_station.current_fcev_avg_soc
 
         c1_flow_base = h2_produced * min(1.0, max(0.5, t1_soc))
         comp_scale = 0.4 + 0.6 * comp_load_ratio
@@ -107,7 +107,7 @@ class HydrogenEnv(gym.Env):
         c3_flow_base = fcev_h2_demand * 0.3
         c3_flow = c3_flow_base * (0.6 + 0.4 * comp_load_ratio)
         c3_power, c3_heat = self.comp_system.compute_c3(
-            c3_flow, avg_fcev_sog=avg_fcev_sog, tank_pressure=t3_3_pressure,
+            c3_flow, avg_fcev_soc=avg_fcev_soc, tank_pressure=t3_3_pressure,
             electricity_price=price, bypass_bias=bypass_bias,
             c3_pressure_bias=c3_pressure_bias)
 

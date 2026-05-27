@@ -695,14 +695,14 @@ class FCEVehicle(Vehicle):
     燃料电池车 (Fuel Cell Electric Vehicle)
     基于SAE J2601协议，快速加氢（3-5分钟）
     """
-    def __init__(self, vehicle_id, arrival_time, tank_capacity, sog_initial, sog_target):
+    def __init__(self, vehicle_id, arrival_time, tank_capacity, soc_initial, soc_target):
         super().__init__(vehicle_id, arrival_time, 'FCEV')
         self.tank_capacity = tank_capacity  # kg H2
-        self.sog_initial = sog_initial  # State of Gas (0-1)
-        self.sog_target = sog_target
+        self.soc_initial = soc_initial  # State of Charge (SOC) (0-1)
+        self.soc_target = soc_target
         
         # 计算所需氢气量
-        self.h2_needed = (sog_target - sog_initial) * tank_capacity  # kg
+        self.h2_needed = (soc_target - soc_initial) * tank_capacity  # kg
         
         # 加氢时间 (分钟)
         self.fill_time_minutes = np.clip(
@@ -935,42 +935,42 @@ class MixedDemandGenerator:
         else:
             tank_capacity = np.random.uniform(8.0, 10.0)  # 商用车
         
-        # 到站SOG (State of Gas) - 根据时段和车型调整
+        # 到站SOC (State of Charge (SOC) - 根据时段和车型调整
         if hour_of_day in Config.peak_morning_hours:
-            # 早高峰: 商用车开始一天工作，SOG中等
-            sog_mean = 0.35
-            sog_std = 0.12
+            # 早高峰: 商用车开始一天工作，SOC中等
+            soc_mean = 0.35
+            soc_std = 0.12
         elif hour_of_day in Config.peak_evening_hours:
-            # 晚高峰: 商用车结束工作，SOG较低
-            sog_mean = 0.18
-            sog_std = 0.08
+            # 晚高峰: 商用车结束工作，SOC较低
+            soc_mean = 0.18
+            soc_std = 0.08
         elif 10 <= hour_of_day <= 16:
-            # 白天: 中途补充，SOG中等偏低
-            sog_mean = 0.25
-            sog_std = 0.10
+            # 白天: 中途补充，SOC中等偏低
+            soc_mean = 0.25
+            soc_std = 0.10
         else:
             # 其他时段
-            sog_mean = Config.fcev_sog_arrival_mean
-            sog_std = Config.fcev_sog_arrival_std
+            soc_mean = Config.fcev_soc_arrival_mean
+            soc_std = Config.fcev_soc_arrival_std
         
-        # 商用车SOG普遍更低 (使用强度大)
+        # 商用车SOC普遍更低 (使用强度大)
         if tank_capacity > 7.0:  # 商用车
-            sog_mean *= 0.8
+            soc_mean *= 0.8
         
-        sog_initial = np.clip(
-            np.random.normal(sog_mean, sog_std),
+        soc_initial = np.clip(
+            np.random.normal(soc_mean, soc_std),
             0.05, 0.50
         )
         
-        # 目标SOG (商用车倾向充更满)
+        # 目标SOC (商用车倾向充更满)
         if tank_capacity > 7.0:
-            sog_target = 0.98  # 商用车充到98%
+            soc_target = 0.98  # 商用车充到98%
         else:
-            sog_target = Config.fcev_sog_target  # 乘用车95%
+            soc_target = Config.fcev_soc_target  # 乘用车95%
         
         return FCEVehicle(
             vehicle_id, arrival_time, tank_capacity,
-            sog_initial, sog_target
+            soc_initial, soc_target
         )
 
 

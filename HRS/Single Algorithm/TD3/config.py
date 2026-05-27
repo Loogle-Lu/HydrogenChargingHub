@@ -142,9 +142,9 @@ class Config:
     fcev_max_pressure_ramp = 15.0  # bar/min (最大爬升率)
     
     # 到站状态分布
-    fcev_sog_arrival_mean = 0.20  # State of Gas平均20% (低渗透率，充装需求高)
-    fcev_sog_arrival_std = 0.10
-    fcev_sog_target = 0.95  # 目标充装到95%
+    fcev_soc_arrival_mean = 0.20  # State of Charge (SOC)平均20% (低渗透率，充装需求高)
+    fcev_soc_arrival_std = 0.10
+    fcev_soc_target = 0.95  # 目标充装到95%
     
     # 加氢服务价格
     fcev_service_price = 12.0  # $/kg (略高于生产成本)

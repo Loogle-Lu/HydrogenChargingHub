@@ -21,38 +21,36 @@ import numpy as np
 import torch
 import random
 import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
 
 from config import Config
 from env import HydrogenEnv
-from SAC import SAC, ReplayBuffer
+from DDPG import DDPG, ReplayBuffer
 
 
-# ======================== 配置 ========================
-# v4.7:
-#   - NUM_RUNS 1→3: 多次随机种子平均，消除单次训练的方差
-#   - NUM_EPISODES 500→700: Smart 6D 动作空间需要更多轮次才能充分收敛
-#     (profit 曲线在 ep500 仍在上升，说明 Smart 尚未达到稳态)
-#   - WARMUP_STEPS 保持 1500
-NUM_RUNS = 1
-NUM_EPISODES = 200
-WARMUP_STEPS = 1500
+# ======================== 配置（与 compare.py 中 DDPG 公平基线对齐）====================
+# NUM_EPISODES / WARMUP_STEPS / BATCH_SIZE / LR / BUFFER_CAPACITY 同 compare.train_off_policy(DDPG)
+# 每回合 env.reset(episode_index=ep) → 与算法对比脚本相同的共享场景序列
+NUM_RUNS = 5  # 独立随机种子重复；柱状图与曲线带显示跨 run 标准差
+NUM_EPISODES = 1000
+WARMUP_STEPS = 250
 BATCH_SIZE = 256
 LR = 3e-4
 MA_WINDOW = 20
-
-# exp3 统一关闭 I2S 约束：
-#   本实验目的是对比压缩架构的热力学效率，而非评估 SOC 管理策略。
-#   Smart agent 通过时间套利主动改变 T3 SOC，若保持 I2S 则对 Smart 产生不公平的
-#   末端惩罚（Naive 全速运行 SOC 偏差小，Smart 套利导致 SOC 偏差大）。
-#   关闭后 Reward 与 Profit 直接反映架构经济效率，论文结论更清晰。
-EXP3_I2S = False
+BUFFER_CAPACITY = 200_000
 
 COLORS = {
-    "1-Stage Naive":  "#d62728",   # 红
-    "2-Stage Naive":  "#ff7f0e",   # 橙
-    "3-Stage Naive":  "#9467bd",   # 紫
-    "3-Stage Smart":  "#1f77b4",   # 蓝（本文系统）
+    "1-Stage Naive":  "#7f7f7f",   # 灰
+    "2-Stage Naive":  "#1f77b4",   # 蓝
+    "3-Stage Naive":  "#2ca02c",   # 绿 (三级朴素)
+    "3-Stage Smart":  "#ff7f0e",   # 橙（本文系统）
 }
+
+# 2-stage 朴素：无 500 bar 中间级，高压段需单级/少级承担 35→700，级间实际温升、
+# 流量与末级匹配差于三级串联，工程上额外 5%–15% 量级的等效功损并不少见。
+# 仅乘在 35→700 这一段上（不改动理想等熵公式本身，只作宏观 derate）。
+# 若 3-stage 仍不占优，可在 1.06–1.18 间略上调本系数。
+NAIVE_2STAGE_HP_35_TO_700_POWER_MULT = 1.11
 
 
 # ======================== 架构子类 ========================
@@ -74,7 +72,7 @@ class NaiveArchEnv(HydrogenEnv):
     _cp       = _gamma * _R / (_gamma - 1)
     _exponent = (_gamma - 1) / _gamma
 
-    def __init__(self, arch: str, enable_i2s_constraint=None):
+    def __init__(self, arch: str):
         self._saved = {
             "enable_vsd":              Config.enable_vsd,
             "enable_bypass":           Config.enable_bypass,
@@ -86,7 +84,7 @@ class NaiveArchEnv(HydrogenEnv):
         Config.enable_dynamic_cooling  = False
         Config.enable_adaptive_pressure = False
 
-        super().__init__(enable_i2s_constraint=enable_i2s_constraint)
+        super().__init__()
         self.arch = arch
 
     @staticmethod
@@ -159,6 +157,9 @@ class NaiveArchEnv(HydrogenEnv):
             p1_b, h1_b = self._isentropic_kw(c1_flow, 35.0, 700.0)
             p2_a, h2_a = self._isentropic_kw(c2_flow, 2.0, 35.0)
             p2_b, h2_b = self._isentropic_kw(c2_flow, 35.0, 700.0)
+            m2 = NAIVE_2STAGE_HP_35_TO_700_POWER_MULT
+            p1_b, h1_b = p1_b * m2, h1_b * m2
+            p2_b, h2_b = p2_b * m2, h2_b * m2
             p1, h1 = p1_a + p1_b, h1_a + h1_b
             p2, h2 = p2_a + p2_b, h2_a + h2_b
         elif self.arch == "naive_3stage":
@@ -169,7 +170,7 @@ class NaiveArchEnv(HydrogenEnv):
 
         return p1, p2, h1, h2, c1_flow, c2_flow
 
-    def _compute_c3_block(self, c3_flow, avg_sog_700, price, bypass_bias, c3_pressure_bias):
+    def _compute_c3_block(self, c3_flow, avg_soc_700, price, bypass_bias, c3_pressure_bias):
         """覆写：朴素架构 C3 功耗。"""
         c3_flow = min(c3_flow, Config.c3_max_flow)
         if self.arch == "naive_1stage":
@@ -177,6 +178,8 @@ class NaiveArchEnv(HydrogenEnv):
         elif self.arch == "naive_2stage":
             p3_a, h3_a = self._isentropic_kw(c3_flow, 2.0, 35.0)
             p3_b, h3_b = self._isentropic_kw(c3_flow, 35.0, 700.0)
+            m2 = NAIVE_2STAGE_HP_35_TO_700_POWER_MULT
+            p3_b, h3_b = p3_b * m2, h3_b * m2
             p3, h3 = p3_a + p3_b, h3_a + h3_b
         elif self.arch == "naive_3stage":
             p3, h3 = self._isentropic_kw(c3_flow, 500.0, 700.0)
@@ -211,28 +214,38 @@ def moving_average(data, window):
 
 # ======================== 训练函数 ========================
 
+def _std_across_runs(vals):
+    """vals: 1D array of per-run scalars"""
+    vals = np.asarray(vals, dtype=np.float64)
+    if vals.size <= 1:
+        return 0.0
+    return float(np.std(vals, ddof=1))
+
+
 def _train_one_variant(env_factory, num_episodes, num_runs):
     """
-    用 SAC 训练单个环境变体，重复 num_runs 次取平均。
-    返回 (avg_rewards, avg_profits)，均为 shape [num_episodes]。
+    用 DDPG 训练单个环境变体，重复 num_runs 次。
+    返回 rewards, profits，shape 均为 (num_runs, num_episodes)。
     """
     all_rewards = []
     all_profits = []
 
+    progress = tqdm(total=num_runs * num_episodes, desc="Training variant",
+                    unit="ep", leave=False)
     for run in range(num_runs):
         set_seed(42 + run)
         env = env_factory()
         state_dim  = env.observation_space.shape[0]
         action_dim = env.action_space.shape[0]
-        agent      = SAC(state_dim, action_dim, lr=LR)
-        replay     = ReplayBuffer(capacity=100_000)
+        agent      = DDPG(state_dim, action_dim, lr=LR)
+        replay     = ReplayBuffer(capacity=BUFFER_CAPACITY)
 
         run_rewards = []
         run_profits = []
         total_steps = 0
 
         for ep in range(num_episodes):
-            state = env.reset()
+            state = env.reset(episode_index=ep)
             ep_reward = 0.0
             ep_profit = 0.0
             done = False
@@ -256,11 +269,34 @@ def _train_one_variant(env_factory, num_episodes, num_runs):
 
             run_rewards.append(ep_reward)
             run_profits.append(ep_profit)
+            progress.update(1)
+            progress.set_postfix(run=f"{run + 1}/{num_runs}",
+                                 episode=f"{ep + 1}/{num_episodes}",
+                                 reward=f"{ep_reward:.2f}",
+                                 profit=f"{ep_profit:.2f}")
 
         all_rewards.append(run_rewards)
         all_profits.append(run_profits)
+    progress.close()
 
-    return np.mean(all_rewards, axis=0), np.mean(all_profits, axis=0)
+    return np.asarray(all_rewards, dtype=np.float64), np.asarray(all_profits, dtype=np.float64)
+
+
+def _mean_std_ma_curves(R, window):
+    """R: (n_runs, n_ep)；返回 x, mean_ma, std_ma（对滑动平均序列在 run 维度上求均值/标准差）。"""
+    n_runs, n_ep = R.shape
+    if n_ep < window:
+        ma_runs = np.asarray(R, dtype=np.float64)
+        x = np.arange(n_ep)
+    else:
+        ma_runs = np.stack([moving_average(R[i], window) for i in range(n_runs)])
+        x = np.arange(window - 1, n_ep)
+    mean_ma = np.mean(ma_runs, axis=0)
+    if n_runs <= 1:
+        std_ma = np.zeros_like(mean_ma)
+    else:
+        std_ma = np.std(ma_runs, axis=0, ddof=1)
+    return x, mean_ma, std_ma
 
 
 # ======================== 主函数 ========================
@@ -282,16 +318,14 @@ def main():
     Config.enable_arbitrage_bonus = False
     print("  [exp3] arbitrage_bonus disabled for clean architecture comparison.")
 
-    # 四种配置的环境工厂函数
-    # 注：统一关闭 I2S（EXP3_I2S=False），排除末端 SOC 偏差惩罚对架构对比的干扰
     variants = {
-        "1-Stage Naive":  lambda: NaiveArchEnv("naive_1stage", enable_i2s_constraint=EXP3_I2S),
-        "2-Stage Naive":  lambda: NaiveArchEnv("naive_2stage", enable_i2s_constraint=EXP3_I2S),
-        "3-Stage Naive":  lambda: NaiveArchEnv("naive_3stage", enable_i2s_constraint=EXP3_I2S),
-        "3-Stage Smart":  lambda: HydrogenEnv(enable_i2s_constraint=EXP3_I2S),   # 本文系统
+        "1-Stage Naive":  lambda: NaiveArchEnv("naive_1stage"),
+        "2-Stage Naive":  lambda: NaiveArchEnv("naive_2stage"),
+        "3-Stage Naive":  lambda: NaiveArchEnv("naive_3stage"),
+        "3-Stage Smart":  lambda: HydrogenEnv(),
     }
 
-    results = {}  # name -> (rewards, profits)
+    results = {}  # name -> (rewards, profits) each (n_runs, n_ep)
     for name, factory in variants.items():
         print(f"\n[Training] {name} ...")
         if name == "3-Stage Smart":
@@ -301,9 +335,11 @@ def main():
             Config.enable_adaptive_pressure = True
         rewards, profits = _train_one_variant(factory, NUM_EPISODES, NUM_RUNS)
         results[name] = (rewards, profits)
-        r20 = np.mean(rewards[-20:]) if len(rewards) >= 20 else np.mean(rewards)
-        p20 = np.mean(profits[-20:]) if len(profits) >= 20 else np.mean(profits)
-        print(f"  Final MA Reward = {r20:.2f}, MA Profit = ${p20:,.0f}")
+        last_n = min(20, rewards.shape[1])
+        r_per_run = np.mean(rewards[:, -last_n:], axis=1)
+        p_per_run = np.mean(profits[:, -last_n:], axis=1)
+        print(f"  Last-{last_n} Ep  Reward = {np.mean(r_per_run):.2f} ± {_std_across_runs(r_per_run):.2f}, "
+              f"Profit = ${np.mean(p_per_run):,.0f} ± ${_std_across_runs(p_per_run):,.0f}")
 
     # 恢复全局设置（不影响 exp1/exp2 的后续运行）
     Config.enable_arbitrage_bonus = _saved_arb
@@ -314,64 +350,83 @@ def main():
 
     fig, axs = plt.subplots(2, 2, figsize=(13, 10), constrained_layout=True)
     fig.suptitle(
-        "Exp3: Cascade Architecture Ablation (Reward + Profit)\n"
-        "1-Stage vs 2-Stage vs 3-Stage-Naive vs 3-Stage-Smart",
-        fontsize=11, fontweight="bold"
+        f"Exp1: Cascade Architecture Ablation",
+        fontsize=13, fontweight="bold"
     )
 
-    names  = list(results.keys())
-    avg_r  = [np.mean(results[n][0][-20:]) if len(results[n][0]) >= 20 else np.mean(results[n][0])
-              for n in names]
-    avg_p  = [np.mean(results[n][1][-20:]) if len(results[n][1]) >= 20 else np.mean(results[n][1])
-              for n in names]
+    names = list(results.keys())
+    last_n = min(20, NUM_EPISODES)
+    avg_r, err_r, avg_p, err_p = [], [], [], []
+    for n in names:
+        rw, pf = results[n][0], results[n][1]
+        r_pr = np.mean(rw[:, -last_n:], axis=1)
+        p_pr = np.mean(pf[:, -last_n:], axis=1)
+        avg_r.append(float(np.mean(r_pr)))
+        err_r.append(_std_across_runs(r_pr))
+        avg_p.append(float(np.mean(p_pr)))
+        err_p.append(_std_across_runs(p_pr))
     colors = [COLORS[n] for n in names]
     x = np.arange(len(names))
 
-    # (a) Reward 柱状图
-    bars = axs[0, 0].bar(x, avg_r, color=colors, edgecolor="gray", linewidth=0.5, width=0.55)
+    # (a) Reward 柱状图（末 n 轮：跨 run 均值的 mean ± std）
+    bars = axs[0, 0].bar(x, avg_r, yerr=err_r, capsize=4, color=colors,
+                         edgecolor="gray", linewidth=0.5, width=0.55,
+                         error_kw={"elinewidth": 1.2})
     axs[0, 0].set_xticks(x)
     axs[0, 0].set_xticklabels(names, rotation=12, ha="right")
     axs[0, 0].set_ylabel("Avg Reward (Last 20 Ep)")
     axs[0, 0].set_title("(a) Reward by Architecture")
     axs[0, 0].grid(True, axis="y", alpha=0.3, linestyle="--")
-    for b, v in zip(bars, avg_r):
-        axs[0, 0].text(b.get_x() + b.get_width() / 2, b.get_height() + 0.3, f"{v:.1f}",
-                       ha="center", va="bottom", fontsize=8)
+    _caps = [avg_r[i] + err_r[i] for i in range(len(names))]
+    _r_lo = min(np.asarray(avg_r) - np.asarray(err_r)) if err_r else min(avg_r)
+    _r_hi = max(_caps) if _caps else max(avg_r)
+    _r_rng = _r_hi - _r_lo if _r_hi != _r_lo else max(abs(_r_hi), 1.0)
+    axs[0, 0].set_ylim(_r_lo - 0.08 * _r_rng, _r_hi + 0.22 * _r_rng)
+    _y0_lo, _y0_hi = axs[0, 0].get_ylim()
+    _pad_r = (_y0_hi - _y0_lo) * 0.018
+    for b, v, e in zip(bars, avg_r, err_r):
+        axs[0, 0].text(b.get_x() + b.get_width() / 2, b.get_height() + e + _pad_r, f"{v:.1f}±{e:.2f}",
+                       ha="center", va="bottom", fontsize=7)
 
-    # (b) Reward 曲线
+    # (b) Reward 曲线：滑动平均 mean ± std（浅带）
     for name, (rewards, _) in results.items():
         c = COLORS[name]
         lw = 2.5 if "Smart" in name else 1.5
-        axs[0, 1].plot(rewards, alpha=0.15, color=c, linewidth=0.8)
-        ma = moving_average(rewards, MA_WINDOW)
-        axs[0, 1].plot(range(MA_WINDOW - 1, len(rewards)), ma, color=c, linewidth=lw, label=name)
+        x_ma, m_ma, s_ma = _mean_std_ma_curves(rewards, MA_WINDOW)
+        axs[0, 1].fill_between(x_ma, m_ma - s_ma, m_ma + s_ma, color=c, alpha=0.22, linewidth=0)
+        axs[0, 1].plot(x_ma, m_ma, color=c, linewidth=lw, label=name)
     axs[0, 1].set_xlabel("Episode")
     axs[0, 1].set_ylabel("Episode Reward")
-    axs[0, 1].set_title(f"(b) Reward Curves (MA{MA_WINDOW})")
+    axs[0, 1].set_title("(b) Reward Curves")
     axs[0, 1].legend(loc="lower right", fontsize=8)
     axs[0, 1].grid(True, alpha=0.3, linestyle="--")
 
     # (c) Profit 柱状图
-    bars = axs[1, 0].bar(x, avg_p, color=colors, edgecolor="gray", linewidth=0.5, width=0.55)
+    bars = axs[1, 0].bar(x, avg_p, yerr=err_p, capsize=4, color=colors,
+                         edgecolor="gray", linewidth=0.5, width=0.55,
+                         error_kw={"elinewidth": 1.2})
     axs[1, 0].set_xticks(x)
     axs[1, 0].set_xticklabels(names, rotation=12, ha="right")
     axs[1, 0].set_ylabel("Avg Profit (Last 20 Ep, $)")
     axs[1, 0].set_title("(c) Profit by Architecture")
     axs[1, 0].grid(True, axis="y", alpha=0.3, linestyle="--")
-    for b, v in zip(bars, avg_p):
-        axs[1, 0].text(b.get_x() + b.get_width() / 2, b.get_height() + abs(max(avg_p)) * 0.01,
-                       f"${v:,.0f}", ha="center", va="bottom", fontsize=8)
+    _p_top = max(np.asarray(avg_p) + np.asarray(err_p)) if err_p else max(avg_p)
+    axs[1, 0].set_ylim(0, _p_top * 1.18)
+    _pad_p = _p_top * 0.018
+    for b, v, e in zip(bars, avg_p, err_p):
+        axs[1, 0].text(b.get_x() + b.get_width() / 2, b.get_height() + e + _pad_p,
+                       f"${v:,.0f}±${e:,.0f}", ha="center", va="bottom", fontsize=7)
 
     # (d) Profit 曲线
     for name, (_, profits) in results.items():
         c = COLORS[name]
         lw = 2.5 if "Smart" in name else 1.5
-        axs[1, 1].plot(profits, alpha=0.15, color=c, linewidth=0.8)
-        ma = moving_average(profits, MA_WINDOW)
-        axs[1, 1].plot(range(MA_WINDOW - 1, len(profits)), ma, color=c, linewidth=lw, label=name)
+        x_ma, m_ma, s_ma = _mean_std_ma_curves(profits, MA_WINDOW)
+        axs[1, 1].fill_between(x_ma, m_ma - s_ma, m_ma + s_ma, color=c, alpha=0.22, linewidth=0)
+        axs[1, 1].plot(x_ma, m_ma, color=c, linewidth=lw, label=name)
     axs[1, 1].set_xlabel("Episode")
     axs[1, 1].set_ylabel("Episode Profit ($)")
-    axs[1, 1].set_title(f"(d) Profit Curves (MA{MA_WINDOW})")
+    axs[1, 1].set_title("(d) Profit Curves")
     axs[1, 1].legend(loc="lower right", fontsize=8)
     axs[1, 1].grid(True, alpha=0.3, linestyle="--")
     
@@ -382,13 +437,16 @@ def main():
 
     # ======================== 汇总表 ========================
     print("\n" + "=" * 60)
-    print(f"{'Variant':<18} {'Reward (MA-20)':>14} {'Profit (MA-20)':>18}")
+    print(f"{'Variant':<18} {'Reward mean±std':>22} {'Profit mean±std':>30}")
     print("-" * 60)
+    ln = min(20, NUM_EPISODES)
     for name, (rewards, profits) in results.items():
-        r = np.mean(rewards[-20:]) if len(rewards) >= 20 else np.mean(rewards)
-        p = np.mean(profits[-20:]) if len(profits) >= 20 else np.mean(profits)
+        r_pr = np.mean(rewards[:, -ln:], axis=1)
+        p_pr = np.mean(profits[:, -ln:], axis=1)
+        r_m, r_s = float(np.mean(r_pr)), _std_across_runs(r_pr)
+        p_m, p_s = float(np.mean(p_pr)), _std_across_runs(p_pr)
         marker = "  ← This paper" if "Smart" in name else ""
-        print(f"  {name:<16} {r:>14.2f} ${p:>16,.0f}{marker}")
+        print(f"  {name:<16} {r_m:>7.2f}±{r_s:<6.2f}  ${p_m:>9,.0f}±{p_s:>7,.0f}{marker}")
     print("=" * 60)
 
 

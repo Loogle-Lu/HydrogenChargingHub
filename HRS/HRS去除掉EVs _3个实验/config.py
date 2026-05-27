@@ -14,13 +14,6 @@ class Config:
     steps_per_day = 96
     episode_length = 96  # 训练一个回合代表一天
 
-    # --- I2S (Identical Initial State) 约束参数 ---
-    enable_i2s_constraint = True
-
-    # [修改] 降低I2S惩罚权重，避免过度保守
-    # v5.0: 1500→800 — 终端惩罚只需提供回归初始SOC的引导，不应主导reward
-    i2s_penalty_weight = 800.0
-
     # --- 物理组件参数 ---
     # 1. 电解槽
     ele_max_power = 1000.0  # kW
@@ -56,17 +49,18 @@ class Config:
     max_intercool_temp = 313.15  # K (40°C) 轻度冷却
     no_cooling_intercool_temp = 313.15  # K 无动态冷却时回退到最高温度(最差工况)
     cooling_price_threshold = 0.10  # $/kWh 高于此电价则轻度冷却
+    cooling_power_kw = 1150.0      # 略提高：电价高时乱开冷却更亏，利于离线SAC学「价-冷」联动
     
     # v3.1: 压力自适应控制 (Adaptive Pressure, APC)
     # C3 输入始终为 T3₃ (500 bar)，因此 APC 输出必须 ≥ 500 bar
-    # 高 SOG 时适当降低 C3 出口压力以节省压缩功
+    # 高 SOC 时适当降低 C3 出口压力以节省压缩功
     enable_adaptive_pressure = True
     adaptive_pressure_map = {
-        0.0: 700,   # SOG 0-70%: 700 bar 快速充装
+        0.0: 700,   # SOC 0-70%: 700 bar 快速充装
         0.7: 700,
-        0.8: 600,   # SOG 70-80%: 600 bar 减少过压缩
-        0.9: 550,   # SOG 80-90%: 550 bar
-        1.0: 500    # SOG 90%+:  500 bar 近似直出 T3₃
+        0.8: 600,   # SOC 70-80%: 600 bar 减少过压缩
+        0.9: 550,   # SOC 80-90%: 550 bar
+        1.0: 500    # SOC 90%+:  500 bar 近似直出 T3₃
     }
     
     # C1: 第一级压缩机 (Electrolyzer output -> T2)
@@ -97,11 +91,11 @@ class Config:
     #   - AP: 自适应压力 → 避免末段过压缩 → 温度平稳 → 充装截断风险↓
     #   - Cooling: 动态级间冷却 → 直接控制压缩出口温度 → 充装完整率最大
     precool_capacity_kw = 30.0        # 预冷系统额定制冷功率 (kW)
-    fill_base_rate = 0.60             # 基础充装完成率 (无任何技术优化时的基准)
-    fill_cool_bonus = 0.22            # 动态冷却控制对完成率的最大提升 (↓ from 0.30)
-    fill_vsd_bonus = 0.06             # VSD: 平稳压缩 → 减少温度冲击
-    fill_bypass_bonus = 0.05          # Bypass: 减少废热 → 预冷裕量↑
-    fill_ap_bonus = 0.04              # AP: 精确压力控制 → 避免末端温度尖峰
+    fill_base_rate = 0.50             # 基础充装完成率
+    fill_cool_bonus = 0.22            # 与 cooling_power_kw 配对：低价段值得多拉冷，高价段需克制
+    fill_vsd_bonus = 0.08             # VSD: 平稳压缩 → 减少温度冲击
+    fill_bypass_bonus = 0.07          # Bypass: 减少废热 → 预冷裕量↑
+    fill_ap_bonus = 0.06              # AP: 精确压力控制 → 避免末端温度尖峰
     fill_heat_penalty = 0.20          # 废热负载每单位对完成率的惩罚 (↓ from 0.35)
     fill_min_rate = 0.40              # 最低充装完成率 (SAE J2601 安全下限, ↑ from 0.35)
 
@@ -121,9 +115,9 @@ class Config:
     t3_1_capacity_kg = 120.0  # kg
     t3_2_capacity_kg = 120.0  # kg
     t3_3_capacity_kg = 120.0  # kg
-    t3_1_max_pressure = 200.0  # barg (低压，FCEV 高 SOG 阶段使用)
+    t3_1_max_pressure = 200.0  # barg (低压，FCEV 高 SOC 阶段使用)
     t3_2_max_pressure = 350.0  # barg (中压)
-    t3_3_max_pressure = 500.0  # barg (高压，FCEV 低 SOG 阶段优先)
+    t3_3_max_pressure = 500.0  # barg (高压，FCEV 低 SOC 阶段优先)
     t3_initial_soc = 0.5
     
     # 差压级联充装最低压差 (bar): 储罐实际压强须超过车辆背压至少此值才能送气
@@ -134,12 +128,12 @@ class Config:
     # 储罐通用参数
     storage_min_level = 0.05
     storage_max_level = 0.95
-    storage_initial = 0.5  # I2S 目标 SOC (用于总系统)
+    storage_initial = 0.5  # 初始 SOC (用于总系统)
 
     # 4. 燃料电池
     fc_max_power = 500.0
     fc_efficiency = 16.0  # kWh/kg
-    fc_reserve_soc = 0.40  # T3 avg SOC 低于此值时抑制 FC (保护 FCEV 服务库存)
+    fc_reserve_soc = 0.30  # T3 avg SOC 低于此值时抑制 FC (保护 FCEV 服务库存)
 
     # 5. 冷却机 (Chiller - 线性模型)
     chiller_rated_capacity = 500.0  # kW (额定冷却能力)
@@ -165,9 +159,9 @@ class Config:
     fcev_max_pressure_ramp = 15.0  # bar/min (最大爬升率)
     
     # 到站状态分布
-    fcev_sog_arrival_mean = 0.20  # State of Gas平均20% (低渗透率，充装需求高)
-    fcev_sog_arrival_std = 0.10
-    fcev_sog_target = 0.95  # 目标充装到95%
+    fcev_soc_arrival_mean = 0.20  # State of Charge (SOC)平均20% (低渗透率，充装需求高)
+    fcev_soc_arrival_std = 0.10
+    fcev_soc_target = 0.95  # 目标充装到95%
     
     # 加氢服务价格 (卖氢收益 >> 卖电给电网，引导智能体优先满足FCEV)
     fcev_service_price = 18.0       # $/kg 700-bar 乘用车 (高压快充溢价)
@@ -253,26 +247,27 @@ class Config:
     #   - zero_export: 多余电弃电，不产生收益
     #   - local_grid: 多余电可卖给地方电网，收购价低于零售价
     grid_export_mode = "local_grid"
-    local_grid_feedin_ratio = 0.42  # 地电网收购价低，卖氢收益 >> 卖电收益
+    local_grid_feedin_ratio = 0.55  # 地电网收购价 (提升以体现售电价值)
     # 防"只卖电不卖氢"策略漏洞: 售电收入计入Profit的上限 = 服务收入(EV+FCEV) × 此比例
-    max_grid_revenue_ratio = 0.35  # 售电收入不超过服务收入的35%，强化卖氢主导
+    max_grid_revenue_ratio = 0.60  # 售电收入不超过服务收入的60% (放宽以区分算法策略)
     
     # 储能套利激励参数 (新增)
-    enable_arbitrage_bonus = True  # 启用储能套利奖励
-    # v4.6: 50→10 大幅降低套利奖励权重，避免 agent 为套利消耗 T3 氢气而牺牲 FCEV 服务收入
-    # 背景: arbitrage_bonus 峰值可达 ~10,000/step，远超 step_profit ~115/step；
-    #       这导致 Smart agent 优化套利而非 profit，使 3-Stage Smart 的 Profit 低于 3-Stage Naive
-    arbitrage_bonus_coef = 10.0  # 套利奖励系数 (↓ from 50)
+    enable_arbitrage_bonus = False  # 关闭: 高系数套利奖励与profit严重偏离, 导致SAC优化错误目标
+    arbitrage_bonus_coef = 8.0   # (unused when disabled)
     soc_health_bonus = 5.0   # SOC在[0.4,0.6]时的健康奖励 (↓ from 20；避免与高 T3 SOC 目标冲突)
     price_threshold_low = 0.06  # $/kWh (低电价阈值，低于此值鼓励制氢)
     price_threshold_high = 0.10  # $/kWh (高电价阈值，高于此值鼓励放电)
     
     # 惩罚参数
     # v5.0: 惩罚权重对齐原则 — 惩罚 > 对应收益损失 (引导方向)，但 << step_profit (不主导reward)
-    penalty_unmet_h2_demand = 200.0   # $/kg 缺氢惩罚 (> fcev_service_price=18, 但不再 >> step_profit≈145)
+    penalty_unmet_h2_demand = 80.0    # $/kg 缺氢惩罚 (> fcev_service_price=18, 降低以避免惩罚主导reward)
     penalty_unmet_ev_demand = 150.0   # $/vehicle 无法服务EV惩罚
     penalty_vehicle_waiting = 10.0    # $/vehicle/hour 等待时间惩罚
-    penalty_fcev_wait = 2.0           # $/vehicle/step 加氢队列等待惩罚
+    penalty_fcev_wait = 1.0           # $/vehicle/step 加氢队列等待惩罚 (降低以减少惩罚噪声)
+
+    # 奖励中心化: 减去一个接近"随机策略平均step_profit"的基线
+    # 效果: 好策略→正reward, 差策略→负reward, 差异在图表上一目了然
+    reward_baseline_per_step = 70.0   # $/step (random policy ≈ $80, good ≈ $120)
 
     # State 归一化常量
     price_max = 0.20   # $/kWh 电价归一化上限 (数据典型峰值约0.15, 留裕量)
@@ -311,10 +306,9 @@ class Config:
     # 显式奖励 RL Agent 降低单位氢气压缩能耗，使 7D 动作空间中的压缩机控制维度有更强的梯度信号
     # 参考值: Naive Max Power [1.0, 0.0, 0.0] 约等效于 3.0 kWh/kg
     # 当 actual_kWh_per_kg < comp_eff_ref_kWh_per_kg 时触发正向奖励
-    enable_comp_eff_bonus = True   # True=开启压缩效率激励 (推荐 exp2 开启)
-    comp_eff_ref_kWh_per_kg = 3.0  # 参考基准能耗 (kWh/kg H2); Naive 基线约在此值附近
-    # v5.0: 3→0.5 仅为 VSD/bypass/APC 维度提供梯度方向，不产生幅值偏离
-    comp_eff_bonus_coef = 0.5      # (↓ from 3; 梯度引导, 不主导reward)
+    enable_comp_eff_bonus = False  # 关闭: 效果太弱, 与profit脱钩
+    comp_eff_ref_kWh_per_kg = 3.0  # (unused when disabled)
+    comp_eff_bonus_coef = 5.0      # (unused when disabled)
 
     # v5.0: 吞吐量激励 → 0 (FCEV服务收益已含在 revenue_fcev → step_profit 中)
     # 保留此参数用于双重计算会导致 reward↑ 而 profit 不变，是 reward-profit 偏离的主因之一

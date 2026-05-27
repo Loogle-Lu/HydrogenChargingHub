@@ -58,16 +58,16 @@ class Config:
     cooling_price_threshold = 0.10  # $/kWh 高于此电价则轻度冷却
     
     # v3.1: 压力自适应控制 (Adaptive Pressure, APC)
-    # 差压级联架构: APC 选择从哪一级 T3 取气，匹配 FCEV SOG
+    # 差压级联架构: APC 选择从哪一级 T3 取气，匹配 FCEV SOC
     enable_adaptive_pressure = True
     adaptive_pressure_map = {
-        0.0: 700,   # SOG 0-30%: 700 bar 快速充装 (从 T3₃ 500bar 经 C3 升压)
+        0.0: 700,   # SOC 0-30%: 700 bar 快速充装 (从 T3₃ 500bar 经 C3 升压)
         0.3: 700,
-        0.4: 500,   # SOG 30-60%: 直接用 T3₃ 500bar 输出
+        0.4: 500,   # SOC 30-60%: 直接用 T3₃ 500bar 输出
         0.6: 500,
-        0.7: 350,   # SOG 60-80%: 降至 T3₂ 350bar 节省压缩功
+        0.7: 350,   # SOC 60-80%: 降至 T3₂ 350bar 节省压缩功
         0.8: 350,
-        0.9: 200    # SOG 80%+: 仅需 T3₁ 200bar 涓流充电
+        0.9: 200    # SOC 80%+: 仅需 T3₁ 200bar 涓流充电
     }
     
     # C1: 第一级压缩机 (Electrolyzer output -> T2)
@@ -102,9 +102,9 @@ class Config:
     t3_1_capacity_kg = 120.0  # kg
     t3_2_capacity_kg = 120.0  # kg
     t3_3_capacity_kg = 120.0  # kg
-    t3_1_max_pressure = 200.0  # barg (低压，FCEV 高 SOG 阶段使用)
+    t3_1_max_pressure = 200.0  # barg (低压，FCEV 高 SOC 阶段使用)
     t3_2_max_pressure = 350.0  # barg (中压)
-    t3_3_max_pressure = 500.0  # barg (高压，FCEV 低 SOG 阶段优先)
+    t3_3_max_pressure = 500.0  # barg (高压，FCEV 低 SOC 阶段优先)
     t3_initial_soc = 0.5
     
     # T4: 已移除 (C3 直充取代 T4 缓冲罐，简化拓扑，在线压缩)
@@ -142,9 +142,9 @@ class Config:
     fcev_max_pressure_ramp = 15.0  # bar/min (最大爬升率)
     
     # 到站状态分布
-    fcev_sog_arrival_mean = 0.20  # State of Gas平均20% (低渗透率，充装需求高)
-    fcev_sog_arrival_std = 0.10
-    fcev_sog_target = 0.95  # 目标充装到95%
+    fcev_soc_arrival_mean = 0.20  # State of Charge (SOC)平均20% (低渗透率，充装需求高)
+    fcev_soc_arrival_std = 0.10
+    fcev_soc_target = 0.95  # 目标充装到95%
     
     # 加氢服务价格 (卖氢收益 >> 卖电给电网，引导智能体优先满足FCEV)
     fcev_service_price = 18.0  # $/kg (远高于制氢成本，卖氢为主要利润源)

@@ -59,15 +59,15 @@ class Config:
     
     # v3.1: 压力自适应控制 (Adaptive Pressure)
     enable_adaptive_pressure = True  # 启用自适应压力
-    # 根据FCEV SOG分段充装压力目标
+    # 根据FCEV SOC分段充装压力目标
     adaptive_pressure_map = {
-        0.0: 700,   # SOG 0-30%: 700bar快速充装
+        0.0: 700,   # SOC 0-30%: 700bar快速充装
         0.3: 700,
-        0.4: 500,   # SOG 30-60%: 500bar中速充装
+        0.4: 500,   # SOC 30-60%: 500bar中速充装
         0.6: 500,
-        0.7: 350,   # SOG 60-80%: 350bar慢速充装
+        0.7: 350,   # SOC 60-80%: 350bar慢速充装
         0.8: 350,
-        0.9: 200    # SOG 80%+: 200bar涓流充电
+        0.9: 200    # SOC 80%+: 200bar涓流充电
     }
     
     # C1: 第一级压缩机 (Electrolyzer output -> T2)
@@ -141,9 +141,9 @@ class Config:
     fcev_max_pressure_ramp = 15.0  # bar/min (最大爬升率)
     
     # 到站状态分布
-    fcev_sog_arrival_mean = 0.20  # State of Gas平均20% (低渗透率，充装需求高)
-    fcev_sog_arrival_std = 0.10
-    fcev_sog_target = 0.95  # 目标充装到95%
+    fcev_soc_arrival_mean = 0.20  # State of Charge (SOC)平均20% (低渗透率，充装需求高)
+    fcev_soc_arrival_std = 0.10
+    fcev_soc_target = 0.95  # 目标充装到95%
     
     # 加氢服务价格
     fcev_service_price = 12.0  # $/kg (略高于生产成本)

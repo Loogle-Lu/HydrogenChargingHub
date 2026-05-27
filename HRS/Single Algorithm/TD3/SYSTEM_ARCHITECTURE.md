@@ -137,7 +137,7 @@
 │  │  └────┬────┘  └────┬────┘  └────┬────┘   │           │
 │  │       │            │            │        │           │
 │  │  FCEV到达: 泊松分布, 时变                 │           │
-│  │  SOG: 20%±10% → 95%                       │           │
+│  │  SOC: 20%±10% → 95%                       │           │
 │  │  时间: 3-5分钟 (SAE J2601)                │           │
 │  │  DR能力: 5% (刚性需求)                    │           │
 │  │  收入: $12/kg H2                          │           │
@@ -407,7 +407,7 @@ SOC健康度奖励 (80步): $50×80 = $4,000
 │                                                          │
 │  1. 车辆到达生成 (泊松过程 + 时变系数)                    │
 │     ├─ EV: 70%, SOC分布, 充电模式                        │
-│     └─ FCEV: 30%, SOG分布                                │
+│     └─ FCEV: 30%, SOC分布                                │
 │                                                          │
 │  2. 电解槽制氢                                            │
 │     └─ H2产量 = power / efficiency                      │
@@ -568,7 +568,7 @@ class EVehicle(Vehicle):
 class FCEVehicle(Vehicle):
     属性:
         - tank_capacity: kg
-        - sog_initial, sog_target
+        - soc_initial, soc_target
         - h2_needed: kg
         - fill_time_hours: 0.05-0.08
         - h2_flow_rate: kg/h
@@ -639,7 +639,7 @@ config.py
 ├─ FCEV加氢参数
 │  ├─ 储氢罐规格 (Nexo)
 │  ├─ 加氢时间和APRR
-│  ├─ SOG分布和目标
+│  ├─ SOC分布和目标
 │  ├─ DR灵活性
 │  └─ 服务价格
 │

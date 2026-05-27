@@ -10,7 +10,7 @@ from data_loader import DataLoader
 
 
 class HydrogenEnv(gym.Env):
-    def __init__(self, enable_i2s_constraint=None):
+    def __init__(self):
         super(HydrogenEnv, self).__init__()
         # 初始化组件
         self.ele = Electrolyzer()
@@ -50,14 +50,9 @@ class HydrogenEnv(gym.Env):
         self.state = None
         self.current_data = None
 
-        if enable_i2s_constraint is None:
-            self.enable_i2s_constraint = Config.enable_i2s_constraint
-        else:
-            self.enable_i2s_constraint = bool(enable_i2s_constraint)
-
-    def reset(self):
+    def reset(self, episode_index=None):
         self.current_step = 0
-        self.data_loader.reset()
+        self.data_loader.reset(episode_index=episode_index)
         self.storage = MultiTankStorage()  # 重置到初始 SOC
         self.chiller.reset()  # 重置冷却机状态
         self.service_station = FCEVServiceStation()  # 重置服务站
@@ -151,7 +146,7 @@ class HydrogenEnv(gym.Env):
               - Config.fill_heat_penalty * heat_load)
         return float(np.clip(ff, Config.fill_min_rate, 1.0))
 
-    def _compute_c3_block(self, c3_flow, avg_sog_700, price, bypass_bias, c3_pressure_bias):
+    def _compute_c3_block(self, c3_flow, avg_soc_700, price, bypass_bias, c3_pressure_bias):
         """
         计算 C3 增压泵功耗 (可被子类覆写用于消融实验).
         返回 (c3_flow, c3_power, c3_heat).
@@ -159,7 +154,7 @@ class HydrogenEnv(gym.Env):
         c3_flow = min(c3_flow, Config.c3_max_flow)
         t3_3_pressure = self.storage.t3_3.max_pressure * self.storage.t3_3.get_soc()
         c3_power, c3_heat = self.comp_system.compute_c3(
-            c3_flow, avg_fcev_sog=avg_sog_700, tank_pressure=t3_3_pressure,
+            c3_flow, avg_fcev_soc=avg_soc_700, tank_pressure=t3_3_pressure,
             electricity_price=price, bypass_bias=bypass_bias,
             c3_pressure_bias=c3_pressure_bias)
         return c3_flow, c3_power, c3_heat
@@ -223,8 +218,8 @@ class HydrogenEnv(gym.Env):
             )
 
         # --- 7. 多储罐系统更新 (统一 Low→High 差压级联) ---
-        avg_sog_350 = self.service_station.current_fcev_350_avg_sog
-        avg_sog_700 = self.service_station.current_fcev_700_avg_sog
+        avg_soc_350 = self.service_station.current_fcev_350_avg_soc
+        avg_soc_700 = self.service_station.current_fcev_700_avg_soc
         soc, excess_h2, shortage_h2, c3_flow = self.storage.step_all(
             h2_from_ele=h2_produced,
             h2_to_c1=c1_flow,
@@ -234,13 +229,13 @@ class HydrogenEnv(gym.Env):
             h2_demand_350=fcev_h2_demand_350,
             h2_for_fc=h2_needed_for_fc,
             h2_demand_700=fcev_h2_demand_700,
-            avg_sog_350=avg_sog_350,
-            avg_sog_700=avg_sog_700,
+            avg_soc_350=avg_soc_350,
+            avg_soc_700=avg_soc_700,
         )
 
         # --- 8. C3 增压泵: 仅处理 500→700 bar 末段 (流量由 step_all 返回) ---
         c3_flow, c3_power, c3_heat = self._compute_c3_block(
-            c3_flow, avg_sog_700, price, bypass_bias, c3_pressure_bias)
+            c3_flow, avg_soc_700, price, bypass_bias, c3_pressure_bias)
 
         total_comp_heat = c1_heat + c2_heat + c3_heat
 
@@ -250,8 +245,10 @@ class HydrogenEnv(gym.Env):
         # --- 9. Chiller (固定 0.8 制冷强度) ---
         chiller_power = self.chiller.compute_power(total_comp_heat, chiller_ratio=0.8)
         
-        # --- 10. 总电力负荷 ---
-        h2_production_load = ele_actual_power + c1_power + c2_power + c3_power + chiller_power
+        # --- 10. 总电力负荷 (含级间冷却功耗) ---
+        cooling_avg = (c1_cool + c2_cool) / 2.0 if Config.enable_dynamic_cooling else 0.0
+        cooling_power_draw = cooling_avg * Config.cooling_power_kw
+        h2_production_load = ele_actual_power + c1_power + c2_power + c3_power + chiller_power + cooling_power_draw
         total_load = h2_production_load
 
         # --- 11. 燃料电池实际发电 (T3₁ 供气, 缺氢时按比例降低) ---
@@ -360,18 +357,11 @@ class HydrogenEnv(gym.Env):
         #    - throughput_bonus 已移除 (与 revenue_fcev 双重计算 → reward-profit 偏离主因)
         #    - comp_efficiency_bonus 保留但系数极低 (仅为 VSD/bypass/APC 提供梯度方向)
         #    - penalty 权重已缩减 (不再主导 reward, 仅作为软约束)
-        step_reward = step_profit + arbitrage_bonus + comp_efficiency_bonus - penalty
+        step_reward = step_profit - Config.reward_baseline_per_step + arbitrage_bonus + comp_efficiency_bonus - penalty
         # =========================================================================
 
         self.current_step += 1
         done = self.current_step >= Config.episode_length
-
-        # --- I2S 约束 (终端惩罚) ---
-        if done and self.enable_i2s_constraint:
-            final_soc = self.storage.get_total_soc()
-            init_soc = Config.storage_initial
-            i2s_penalty = abs(final_soc - init_soc) * Config.i2s_penalty_weight
-            step_reward -= i2s_penalty
 
         # --- 奖励裁剪 (v5.0: 收窄范围，profit-aligned后极端值更少) ---
         step_reward = np.clip(step_reward, -2000.0, 2000.0)
@@ -417,6 +407,7 @@ class HydrogenEnv(gym.Env):
             "comp_c2_power": c2_power,
             "comp_c3_power": c3_power,
             "chiller_power": chiller_power,
+            "cooling_power": cooling_power_draw,
             "bypass_activations": self.comp_system.bypass_activations.copy(),
             "tank_socs": self.storage.get_tank_socs(),
             # FCEV需求分解
@@ -451,8 +442,8 @@ class HydrogenEnv(gym.Env):
             # 差压级联统计
             "fill_factor": fill_factor,
             "c3_booster_flow": c3_flow,
-            "avg_sog_350": avg_sog_350,
-            "avg_sog_700": avg_sog_700,
+            "avg_soc_350": avg_soc_350,
+            "avg_soc_700": avg_soc_700,
         }
 
         # v3.5: 奖励缩放 (100) 保持梯度尺度适中

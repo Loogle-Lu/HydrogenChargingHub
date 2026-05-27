@@ -221,7 +221,7 @@ class MultiStageCompressorSystem:
     
     v3.1 新增功能:
     1. 智能旁路控制: 储罐压力充足时跳过压缩
-    2. 自适应压力控制: 根据FCEV SOG动态调整目标压力
+    2. 自适应压力控制: 根据FCEV SOC动态调整目标压力
     """
     def __init__(self):
         self.c1 = Compressor(
@@ -263,11 +263,11 @@ class MultiStageCompressorSystem:
         
         return pressure_ok and demand_ok
     
-    def _compute_adaptive_target_pressure(self, avg_fcev_sog):
+    def _compute_adaptive_target_pressure(self, avg_fcev_soc):
         """
-        v3.1: 根据FCEV平均SOG计算自适应目标压力
+        v3.1: 根据FCEV平均SOC计算自适应目标压力
         
-        SOG分段充装策略:
+        SOC分段充装策略:
         - 0-30%: 700bar (快速充装)
         - 30-60%: 500bar (中速充装)
         - 60-80%: 350bar (慢速充装)
@@ -279,10 +279,10 @@ class MultiStageCompressorSystem:
         # 从映射表查找目标压力
         map_points = sorted(Config.adaptive_pressure_map.keys())
         for i in range(len(map_points)):
-            if avg_fcev_sog <= map_points[i]:
+            if avg_fcev_soc <= map_points[i]:
                 return Config.adaptive_pressure_map[map_points[i]]
         
-        # 超过最大SOG，返回最低压力
+        # 超过最大SOC，返回最低压力
         return Config.adaptive_pressure_map[map_points[-1]]
     
     def compute_c1(self, mass_flow, tank_pressure=0, electricity_price=0.08):
@@ -320,16 +320,16 @@ class MultiStageCompressorSystem:
         
         return self.c2.compute_power(mass_flow, electricity_price)
     
-    def compute_c3(self, mass_flow, avg_fcev_sog=0.5, tank_pressure=0, electricity_price=0.08):
+    def compute_c3(self, mass_flow, avg_fcev_soc=0.5, tank_pressure=0, electricity_price=0.08):
         """
         C3压缩: T3/T4 -> D2 LDFV(700bar)
         
         v3.1: 
-        1. 自适应压力控制（根据FCEV SOG）
+        1. 自适应压力控制（根据FCEV SOC）
         2. 旁路判断
         """
         # 计算自适应目标压力
-        target_pressure = self._compute_adaptive_target_pressure(avg_fcev_sog)
+        target_pressure = self._compute_adaptive_target_pressure(avg_fcev_soc)
         
         # 检查旁路
         if Config.enable_bypass and self._check_bypass(tank_pressure, target_pressure, mass_flow):
@@ -357,7 +357,7 @@ class MultiStageCompressorSystem:
         return power, heat
     
     def compute_total_power(self, flow_c1, flow_c2, flow_c3, 
-                           tank_pressures=None, avg_fcev_sog=0.5, electricity_price=0.08):
+                           tank_pressures=None, avg_fcev_soc=0.5, electricity_price=0.08):
         """
         计算所有压缩机的总功耗和热负荷
         
@@ -368,7 +368,7 @@ class MultiStageCompressorSystem:
         
         p1, h1 = self.compute_c1(flow_c1, tank_pressures.get('t2', 0), electricity_price)
         p2, h2 = self.compute_c2(flow_c2, tank_pressures.get('t3', 0), electricity_price)
-        p3, h3 = self.compute_c3(flow_c3, avg_fcev_sog, tank_pressures.get('t4', 0), electricity_price)
+        p3, h3 = self.compute_c3(flow_c3, avg_fcev_soc, tank_pressures.get('t4', 0), electricity_price)
         
         return (p1 + p2 + p3), (h1 + h2 + h3)
     
@@ -819,14 +819,14 @@ class FCEVehicle(Vehicle):
     燃料电池车 (Fuel Cell Electric Vehicle)
     基于SAE J2601协议，快速加氢（3-5分钟）
     """
-    def __init__(self, vehicle_id, arrival_time, tank_capacity, sog_initial, sog_target):
+    def __init__(self, vehicle_id, arrival_time, tank_capacity, soc_initial, soc_target):
         super().__init__(vehicle_id, arrival_time, 'FCEV')
         self.tank_capacity = tank_capacity  # kg H2
-        self.sog_initial = sog_initial  # State of Gas (0-1)
-        self.sog_target = sog_target
+        self.soc_initial = soc_initial  # State of Charge (SOC) (0-1)
+        self.soc_target = soc_target
         
         # 计算所需氢气量
-        self.h2_needed = (sog_target - sog_initial) * tank_capacity  # kg
+        self.h2_needed = (soc_target - soc_initial) * tank_capacity  # kg
         
         # 加氢时间 (分钟)
         self.fill_time_minutes = np.clip(
@@ -1059,42 +1059,42 @@ class MixedDemandGenerator:
         else:
             tank_capacity = np.random.uniform(8.0, 10.0)  # 商用车
         
-        # 到站SOG (State of Gas) - 根据时段和车型调整
+        # 到站SOC (State of Charge (SOC) - 根据时段和车型调整
         if hour_of_day in Config.peak_morning_hours:
-            # 早高峰: 商用车开始一天工作，SOG中等
-            sog_mean = 0.35
-            sog_std = 0.12
+            # 早高峰: 商用车开始一天工作，SOC中等
+            soc_mean = 0.35
+            soc_std = 0.12
         elif hour_of_day in Config.peak_evening_hours:
-            # 晚高峰: 商用车结束工作，SOG较低
-            sog_mean = 0.18
-            sog_std = 0.08
+            # 晚高峰: 商用车结束工作，SOC较低
+            soc_mean = 0.18
+            soc_std = 0.08
         elif 10 <= hour_of_day <= 16:
-            # 白天: 中途补充，SOG中等偏低
-            sog_mean = 0.25
-            sog_std = 0.10
+            # 白天: 中途补充，SOC中等偏低
+            soc_mean = 0.25
+            soc_std = 0.10
         else:
             # 其他时段
-            sog_mean = Config.fcev_sog_arrival_mean
-            sog_std = Config.fcev_sog_arrival_std
+            soc_mean = Config.fcev_soc_arrival_mean
+            soc_std = Config.fcev_soc_arrival_std
         
-        # 商用车SOG普遍更低 (使用强度大)
+        # 商用车SOC普遍更低 (使用强度大)
         if tank_capacity > 7.0:  # 商用车
-            sog_mean *= 0.8
+            soc_mean *= 0.8
         
-        sog_initial = np.clip(
-            np.random.normal(sog_mean, sog_std),
+        soc_initial = np.clip(
+            np.random.normal(soc_mean, soc_std),
             0.05, 0.50
         )
         
-        # 目标SOG (商用车倾向充更满)
+        # 目标SOC (商用车倾向充更满)
         if tank_capacity > 7.0:
-            sog_target = 0.98  # 商用车充到98%
+            soc_target = 0.98  # 商用车充到98%
         else:
-            sog_target = Config.fcev_sog_target  # 乘用车95%
+            soc_target = Config.fcev_soc_target  # 乘用车95%
         
         return FCEVehicle(
             vehicle_id, arrival_time, tank_capacity,
-            sog_initial, sog_target
+            soc_initial, soc_target
         )
 
 
@@ -1103,7 +1103,7 @@ class IntegratedServiceStation:
     集成服务站 (EV充电 + FCEV加氢)
     管理车辆队列、服务调度、需求响应
     
-    v3.1: 新增FCEV平均SOG追踪，用于自适应压力控制
+    v3.1: 新增FCEV平均SOC追踪，用于自适应压力控制
     """
     def __init__(self):
         # EV充电设施
@@ -1126,8 +1126,8 @@ class IntegratedServiceStation:
         self.total_fcev_revenue = 0.0
         self.total_vehicles_delayed = 0
         
-        # v3.1: FCEV SOG追踪
-        self.current_fcev_avg_sog = 0.5  # 当前服务的FCEV平均SOG
+        # v3.1: FCEV SOC追踪
+        self.current_fcev_avg_soc = 0.5  # 当前服务的FCEV平均SOC
     
     def add_vehicles(self, ev_list, fcev_list):
         """添加新到达车辆"""
@@ -1169,17 +1169,17 @@ class IntegratedServiceStation:
         fcev_revenue += fcev_rev
         unmet_penalty += fcev_penalty
         
-        # v3.1: 更新当前服务FCEV的平均SOG
+        # v3.1: 更新当前服务FCEV的平均SOC
         if len(self.fcev_being_served) > 0:
-            total_sog = sum(fcev.sog_initial for fcev in self.fcev_being_served)
-            self.current_fcev_avg_sog = total_sog / len(self.fcev_being_served)
+            total_soc = sum(fcev.soc_initial for fcev in self.fcev_being_served)
+            self.current_fcev_avg_soc = total_soc / len(self.fcev_being_served)
         else:
             # 无FCEV在服务，使用队列平均值或默认值
             if len(self.fcev_queue) > 0:
-                total_sog = sum(fcev.sog_initial for fcev in self.fcev_queue[:3])  # 前3辆
-                self.current_fcev_avg_sog = total_sog / min(3, len(self.fcev_queue))
+                total_soc = sum(fcev.soc_initial for fcev in self.fcev_queue[:3])  # 前3辆
+                self.current_fcev_avg_soc = total_soc / min(3, len(self.fcev_queue))
             else:
-                self.current_fcev_avg_sog = 0.5  # 默认50%
+                self.current_fcev_avg_soc = 0.5  # 默认50%
         
         return ev_power_demand, fcev_h2_demand, ev_revenue, fcev_revenue, unmet_penalty
     

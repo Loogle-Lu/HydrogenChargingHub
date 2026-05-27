@@ -232,7 +232,7 @@ class MultiStageCompressorSystem:
     
     v3.1 新增功能:
     1. 智能旁路控制: 储罐压力充足时跳过压缩
-    2. 自适应压力控制: 根据FCEV SOG动态调整目标压力
+    2. 自适应压力控制: 根据FCEV SOC动态调整目标压力
     """
     def __init__(self):
         self.c1 = Compressor(
@@ -254,30 +254,41 @@ class MultiStageCompressorSystem:
             name="C3"
         )
         
-        # v3.1: 旁路统计
-        self.bypass_activations = {'c1': 0, 'c2': 0, 'c3': 0}
+        # v3.1: 旁路统计 (v6.0: 改为累计连续旁路比例)
+        self.bypass_activations = {'c1': 0.0, 'c2': 0.0, 'c3': 0.0}
         self.energy_saved_by_bypass = 0.0  # kWh
     
-    def _check_bypass(self, tank_pressure, target_pressure, demand, bypass_bias=None):
+    def _compute_bypass_ratio(self, tank_pressure, target_pressure, demand, bypass_bias=None):
         """
-        v3.1: 判断是否可以启用旁路
-        v3.6: bypass_bias [0,1] 0=保守(阈值0.9) 1=积极(阈值0.7)
+        v6.0: 连续旁路比例 [0, 1], 取代二值 _check_bypass.
+
+        bypass_bias (RL action) 控制旁路积极程度;
+        物理条件 (压力裕量、需求水平) 调制实际可行旁路比例.
+        输出 = bypass_bias × pressure_factor × demand_factor.
         """
         if not Config.enable_bypass:
-            return False
-        
-        if bypass_bias is not None:
-            # bypass_bias=0 保守(高阈值0.9), bypass_bias=1 积极(低阈值0.7)
-            eff_threshold = 0.9 - 0.2 * np.clip(bypass_bias, 0, 1)
+            return 0.0
+
+        if bypass_bias is None:
+            bypass_bias = 0.5
+        bypass_bias = float(np.clip(bypass_bias, 0.0, 1.0))
+
+        # 压力可行性: tank_pressure / target 在 [0.6, 0.9] 区间线性映射到 [0, 1]
+        if target_pressure > 0:
+            pr = tank_pressure / target_pressure
+            pressure_factor = float(np.clip((pr - 0.6) / 0.3, 0.0, 1.0))
         else:
-            eff_threshold = Config.bypass_pressure_threshold
-        pressure_ok = tank_pressure >= target_pressure * eff_threshold
-        demand_ok = demand <= Config.bypass_demand_threshold
-        return pressure_ok and demand_ok
+            pressure_factor = 1.0
+
+        # 需求可行性: demand 越低旁路越容易 (2× threshold 处降为 0)
+        demand_factor = float(np.clip(
+            1.0 - demand / (Config.bypass_demand_threshold * 2.0), 0.0, 1.0))
+
+        return float(np.clip(bypass_bias * pressure_factor * demand_factor, 0.0, 1.0))
     
-    def _compute_adaptive_target_pressure(self, avg_fcev_sog, c3_pressure_bias=None):
+    def _compute_adaptive_target_pressure(self, avg_fcev_soc, c3_pressure_bias=None):
         """
-        v3.1: 根据FCEV平均SOG计算自适应目标压力
+        v3.1: 根据FCEV平均SOC计算自适应目标压力
         v3.6: c3_pressure_bias [0,1] 0.5=默认, 0=降压省功耗, 1=升压快充
         """
         if not Config.enable_adaptive_pressure:
@@ -285,7 +296,7 @@ class MultiStageCompressorSystem:
         else:
             map_points = sorted(Config.adaptive_pressure_map.keys())
             for i in range(len(map_points)):
-                if avg_fcev_sog <= map_points[i]:
+                if avg_fcev_soc <= map_points[i]:
                     base = Config.adaptive_pressure_map[map_points[i]]
                     break
             else:
@@ -300,69 +311,66 @@ class MultiStageCompressorSystem:
     def compute_c1(self, mass_flow, tank_pressure=0, electricity_price=0.08, cooling_intensity=None, bypass_bias=None):
         """
         C1压缩: T1(2bar) -> T2(35bar)
-        v3.6: 支持 bypass_bias
+        v6.0: 连续旁路 — bypass_ratio 调制实际功耗与废热
         """
-        if Config.enable_bypass and self._check_bypass(tank_pressure, Config.c1_output_pressure, mass_flow, bypass_bias):
-            # 旁路激活: T2压力足够，直接供气
-            self.bypass_activations['c1'] += 1
-            
-            # 估算节省的能量（正常压缩功耗）
-            normal_power, _ = self.c1.compute_power(mass_flow, electricity_price, cooling_intensity)
-            self.energy_saved_by_bypass += normal_power * Config.dt
-            
-            return 0.0, 0.0  # 旁路：功耗和热量均为0
-        
-        return self.c1.compute_power(mass_flow, electricity_price, cooling_intensity)
+        bypass_ratio = self._compute_bypass_ratio(
+            tank_pressure, Config.c1_output_pressure, mass_flow, bypass_bias)
+
+        full_power, full_heat = self.c1.compute_power(
+            mass_flow, electricity_price, cooling_intensity)
+
+        if bypass_ratio > 0.01:
+            self.bypass_activations['c1'] += bypass_ratio
+            self.energy_saved_by_bypass += bypass_ratio * full_power * Config.dt
+
+        return (1.0 - bypass_ratio) * full_power, (1.0 - bypass_ratio) * full_heat
     
     def compute_c2(self, mass_flow, tank_pressure=0, electricity_price=0.08, cooling_intensity=None, bypass_bias=None):
         """
         C2压缩: T2(35bar) -> T3系统(500bar)
-        v3.6: 支持 bypass_bias
+        v6.0: 连续旁路
         """
-        if Config.enable_bypass and self._check_bypass(tank_pressure, Config.c2_output_pressure, mass_flow, bypass_bias):
-            # 旁路激活
-            self.bypass_activations['c2'] += 1
-            
-            normal_power, _ = self.c2.compute_power(mass_flow, electricity_price, cooling_intensity)
-            self.energy_saved_by_bypass += normal_power * Config.dt
-            
-            return 0.0, 0.0
-        
-        return self.c2.compute_power(mass_flow, electricity_price, cooling_intensity)
+        bypass_ratio = self._compute_bypass_ratio(
+            tank_pressure, Config.c2_output_pressure, mass_flow, bypass_bias)
+
+        full_power, full_heat = self.c2.compute_power(
+            mass_flow, electricity_price, cooling_intensity)
+
+        if bypass_ratio > 0.01:
+            self.bypass_activations['c2'] += bypass_ratio
+            self.energy_saved_by_bypass += bypass_ratio * full_power * Config.dt
+
+        return (1.0 - bypass_ratio) * full_power, (1.0 - bypass_ratio) * full_heat
     
-    def compute_c3(self, mass_flow, avg_fcev_sog=0.5, tank_pressure=0, electricity_price=0.08,
+    def compute_c3(self, mass_flow, avg_fcev_soc=0.5, tank_pressure=0, electricity_price=0.08,
                    bypass_bias=None, c3_pressure_bias=None):
         """
         C3压缩: T3/T4 -> D2 LDFV(700bar)
-        v3.6: 支持 bypass_bias, c3_pressure_bias
+        v6.0: 连续旁路 + 自适应压力
         """
-        target_pressure = self._compute_adaptive_target_pressure(avg_fcev_sog, c3_pressure_bias)
-        if Config.enable_bypass and self._check_bypass(tank_pressure, target_pressure, mass_flow, bypass_bias):
-            self.bypass_activations['c3'] += 1
-            
-            # 使用原有目标压力估算节能（保守估计）
-            self.c3.p_out = Config.c3_output_pressure
-            normal_power, _ = self.c3.compute_power(mass_flow, electricity_price)
-            self.energy_saved_by_bypass += normal_power * Config.dt
-            
-            return 0.0, 0.0
-        
+        target_pressure = self._compute_adaptive_target_pressure(avg_fcev_soc, c3_pressure_bias)
+        bypass_ratio = self._compute_bypass_ratio(
+            tank_pressure, target_pressure, mass_flow, bypass_bias)
+
         # 动态调整C3目标压力
         original_p_out = self.c3.p_out
         self.c3.p_out = target_pressure
         self.c3.pressure_ratio = target_pressure / self.c3.p_in
-        
-        # 计算功耗和热量
-        power, heat = self.c3.compute_power(mass_flow, electricity_price)
-        
-        # 恢复原始目标压力（避免影响其他计算）
+
+        full_power, full_heat = self.c3.compute_power(mass_flow, electricity_price)
+
+        # 恢复原始目标压力
         self.c3.p_out = original_p_out
         self.c3.pressure_ratio = original_p_out / self.c3.p_in
-        
-        return power, heat
+
+        if bypass_ratio > 0.01:
+            self.bypass_activations['c3'] += bypass_ratio
+            self.energy_saved_by_bypass += bypass_ratio * full_power * Config.dt
+
+        return (1.0 - bypass_ratio) * full_power, (1.0 - bypass_ratio) * full_heat
     
     def compute_total_power(self, flow_c1, flow_c2, flow_c3, 
-                           tank_pressures=None, avg_fcev_sog=0.5, electricity_price=0.08):
+                           tank_pressures=None, avg_fcev_soc=0.5, electricity_price=0.08):
         """
         计算所有压缩机的总功耗和热负荷
         
@@ -374,7 +382,7 @@ class MultiStageCompressorSystem:
 
         p1, h1 = self.compute_c1(flow_c1, tank_pressures.get('t2', 0), electricity_price)
         p2, h2 = self.compute_c2(flow_c2, tank_pressures.get('t3', 0), electricity_price)
-        p3, h3 = self.compute_c3(flow_c3, avg_fcev_sog, tank_pressures.get('t3_3', 0), electricity_price)
+        p3, h3 = self.compute_c3(flow_c3, avg_fcev_soc, tank_pressures.get('t3_3', 0), electricity_price)
         
         return (p1 + p2 + p3), (h1 + h2 + h3)
     
@@ -403,7 +411,7 @@ class MultiStageCompressorSystem:
         self.c1.reset()
         self.c2.reset()
         self.c3.reset()
-        self.bypass_activations = {'c1': 0, 'c2': 0, 'c3': 0}
+        self.bypass_activations = {'c1': 0.0, 'c2': 0.0, 'c3': 0.0}
         self.energy_saved_by_bypass = 0.0
 
 
@@ -485,7 +493,7 @@ class MultiTankStorage:
     核心创新: T3 三罐采用差压分级 (200 / 350 / 500 bar), 统一 Low→High 级联协议
     - C2 充装时优先填充压力最低的储罐 (最大 deficit 权重)
     - 两种车型均遵循 Low→High 级联: 从最低压储罐开始
-    - **动态压力门控**: SOG 边界 = (max_p × SOC - min_dp) / target_p, 随储罐消耗实时变化
+    - **动态压力门控**: SOC 边界 = (max_p × SOC - min_dp) / target_p, 随储罐消耗实时变化
       储罐实际压强不足时自动跳过, 无需人工设定固定切换点
     - 350-bar HDV: T3₁→T3₂→T3₃ 级联直充 (T3₃ 在 T3₂ 压力不足时补充顶充)
     - 700-bar LDV: T3₁→T3₂→T3₃ 级联直充 + T3₃→C3 增压末段
@@ -540,46 +548,46 @@ class MultiTankStorage:
         f3 = h2_from_c2 * deficit3 / total_deficit
         return f1, f2, f3
 
-    def _compute_dynamic_sog_boundaries(self, target_pressure):
+    def _compute_dynamic_soc_boundaries(self, target_pressure):
         """
-        根据各储罐当前 **实际压强** 计算 SOG 边界 (Low→High 差压级联).
+        根据各储罐当前 **实际压强** 计算 SOC 边界 (Low→High 差压级联).
 
         实际压强 = max_pressure × SOC，随气体消耗而降低.
         储罐只有在 (实际压强 - 最低压差) > 车辆背压 时才能送气.
 
-        返回 (sog_b1, sog_b2, sog_b3)：各罐能服务到的车辆 SOG 上限.
+        返回 (soc_b1, soc_b2, soc_b3)：各罐能服务到的车辆 SOC 上限.
         """
         min_dp = Config.min_cascade_pressure_diff
         p1_actual = Config.t3_1_max_pressure * self.t3_1.get_soc()
         p2_actual = Config.t3_2_max_pressure * self.t3_2.get_soc()
         p3_actual = Config.t3_3_max_pressure * self.t3_3.get_soc()
 
-        sog_b1 = max(0.0, (p1_actual - min_dp) / target_pressure)
-        sog_b2 = max(0.0, (p2_actual - min_dp) / target_pressure)
-        sog_b3 = max(0.0, (p3_actual - min_dp) / target_pressure)
-        return sog_b1, sog_b2, sog_b3
+        soc_b1 = max(0.0, (p1_actual - min_dp) / target_pressure)
+        soc_b2 = max(0.0, (p2_actual - min_dp) / target_pressure)
+        soc_b3 = max(0.0, (p3_actual - min_dp) / target_pressure)
+        return soc_b1, soc_b2, soc_b3
 
-    def _cascade_discharge_350(self, h2_demand_350, avg_sog_350=0.2):
+    def _cascade_discharge_350(self, h2_demand_350, avg_soc_350=0.2):
         """
         350-bar HDV 差压级联充装 (Low→High, SAE J2601):
           Phase 1: T3₁ → 车辆  (实际压强 > 车辆背压 + min_dp)
           Phase 2: T3₂ → 车辆
           Phase 3: T3₃ → 车辆  (T3₂ 压力不足时由 T3₃ 补充顶充)
-        SOG 边界为 **动态值**, 随储罐 SOC 变化.
+        SOC 边界为 **动态值**, 随储罐 SOC 变化.
         返回 (take_t3_1, take_t3_2, take_t3_3) kg/h.
         """
         target_p = 350.0
-        sog_target = Config.fcev_sog_target
-        sog_start = avg_sog_350
-        sog_range = sog_target - sog_start
-        if sog_range <= 1e-6:
+        soc_target = Config.fcev_soc_target
+        soc_start = avg_soc_350
+        soc_range = soc_target - soc_start
+        if soc_range <= 1e-6:
             return 0.0, 0.0, 0.0
 
-        sog_b1, sog_b2, sog_b3 = self._compute_dynamic_sog_boundaries(target_p)
+        soc_b1, soc_b2, soc_b3 = self._compute_dynamic_soc_boundaries(target_p)
 
-        frac_t31 = max(0.0, min(sog_b1, sog_target) - sog_start) / sog_range
-        frac_t32 = max(0.0, min(sog_b2, sog_target) - max(sog_start, sog_b1)) / sog_range
-        frac_t33 = max(0.0, min(sog_b3, sog_target) - max(sog_start, sog_b2)) / sog_range
+        frac_t31 = max(0.0, min(soc_b1, soc_target) - soc_start) / soc_range
+        frac_t32 = max(0.0, min(soc_b2, soc_target) - max(soc_start, soc_b1)) / soc_range
+        frac_t33 = max(0.0, min(soc_b3, soc_target) - max(soc_start, soc_b2)) / soc_range
 
         avail1 = max(0.0, (self.t3_1.level - self.t3_1.min_lvl) / Config.dt)
         avail2 = max(0.0, (self.t3_2.level - self.t3_2.min_lvl) / Config.dt)
@@ -591,27 +599,27 @@ class MultiTankStorage:
 
         return take1, take2, take3
 
-    def _cascade_discharge_700(self, h2_demand_700, avg_sog_700=0.2):
+    def _cascade_discharge_700(self, h2_demand_700, avg_soc_700=0.2):
         """
         700-bar LDV 差压级联充装 + C3 增压 (Low→High, SAE J2601):
           Phase 1-3: T3₁→T3₂→T3₃ 直充 (动态压力门控)
           Phase 4:   T3₃ → C3 → 700 bar (增压泵, 级联直充覆盖不到的部分)
-        SOG 边界为 **动态值**, 随储罐 SOC 变化.
+        SOC 边界为 **动态值**, 随储罐 SOC 变化.
         返回 (take_t3_1, take_t3_2, take_t3_3_direct, take_for_c3) kg/h.
         """
         target_p = 700.0
-        sog_target = Config.fcev_sog_target
-        sog_start = avg_sog_700
-        sog_range = sog_target - sog_start
-        if sog_range <= 1e-6:
+        soc_target = Config.fcev_soc_target
+        soc_start = avg_soc_700
+        soc_range = soc_target - soc_start
+        if soc_range <= 1e-6:
             return 0.0, 0.0, 0.0, 0.0
 
-        sog_b1, sog_b2, sog_b3 = self._compute_dynamic_sog_boundaries(target_p)
+        soc_b1, soc_b2, soc_b3 = self._compute_dynamic_soc_boundaries(target_p)
 
-        frac_t31 = max(0.0, min(sog_b1, sog_target) - sog_start) / sog_range
-        frac_t32 = max(0.0, min(sog_b2, sog_target) - max(sog_start, sog_b1)) / sog_range
-        frac_t33 = max(0.0, min(sog_b3, sog_target) - max(sog_start, sog_b2)) / sog_range
-        frac_c3  = max(0.0, sog_target - max(sog_start, sog_b3)) / sog_range
+        frac_t31 = max(0.0, min(soc_b1, soc_target) - soc_start) / soc_range
+        frac_t32 = max(0.0, min(soc_b2, soc_target) - max(soc_start, soc_b1)) / soc_range
+        frac_t33 = max(0.0, min(soc_b3, soc_target) - max(soc_start, soc_b2)) / soc_range
+        frac_c3  = max(0.0, soc_target - max(soc_start, soc_b3)) / soc_range
 
         avail1 = max(0.0, (self.t3_1.level - self.t3_1.min_lvl) / Config.dt)
         avail2 = max(0.0, (self.t3_2.level - self.t3_2.min_lvl) / Config.dt)
@@ -628,11 +636,11 @@ class MultiTankStorage:
 
     def step_all(self, h2_from_ele, h2_to_c1, h2_from_c1, h2_to_c2,
                  h2_from_c2, h2_demand_350, h2_for_fc,
-                 h2_demand_700, avg_sog_350=0.2, avg_sog_700=0.2):
+                 h2_demand_700, avg_soc_350=0.2, avg_soc_700=0.2):
         """
         更新所有储罐状态 (统一 Low→High 差压级联协议, 动态压力门控).
 
-        H₂ 流动规则 (SOG 边界随储罐 SOC 动态变化):
+        H₂ 流动规则 (SOC 边界随储罐 SOC 动态变化):
           T1  ← Electrolyzer;  T1 → C1
           T2  ← C1;            T2 → C2
           T3₁ ← C2(差压充装);  T3₁ → FuelCell + 350-bar(Phase1) + 700-bar(Phase1)
@@ -654,11 +662,11 @@ class MultiTankStorage:
 
         # 350-bar HDV: T3₁→T3₂→T3₃ (动态压力门控, T3₃ 在 T3₂ 压力不足时顶充)
         take_350_t1, take_350_t2, take_350_t3 = \
-            self._cascade_discharge_350(h2_demand_350, avg_sog_350)
+            self._cascade_discharge_350(h2_demand_350, avg_soc_350)
 
         # 700-bar LDV: T3₁→T3₂→T3₃ 直充 + T3₃→C3 增压
         take_700_t1, take_700_t2, take_700_t3_direct, take_700_c3 = \
-            self._cascade_discharge_700(h2_demand_700, avg_sog_700)
+            self._cascade_discharge_700(h2_demand_700, avg_soc_700)
 
         # T3₁: FC + 350-bar(Phase1) + 700-bar(Phase1 直充)
         soc_t3_1, ex1, sh1 = self.t3_1.step(fill1, h2_for_fc + take_350_t1 + take_700_t1)
@@ -890,16 +898,16 @@ class FCEVehicle(Vehicle):
     基于SAE J2601协议，快速加氢（3-5分钟）
     target_pressure: 350 bar (公交/卡车) 或 700 bar (乘用车)
     """
-    def __init__(self, vehicle_id, arrival_time, tank_capacity, sog_initial, sog_target,
+    def __init__(self, vehicle_id, arrival_time, tank_capacity, soc_initial, soc_target,
                  target_pressure=700):
         super().__init__(vehicle_id, arrival_time, 'FCEV')
         self.tank_capacity = tank_capacity  # kg H2
-        self.sog_initial = sog_initial  # State of Gas (0-1)
-        self.sog_target = sog_target
+        self.soc_initial = soc_initial  # State of Charge (SOC) (0-1)
+        self.soc_target = soc_target
         self.target_pressure = target_pressure  # 350 or 700 bar
         
         # 计算所需氢气量
-        self.h2_needed = (sog_target - sog_initial) * tank_capacity  # kg
+        self.h2_needed = (soc_target - soc_initial) * tank_capacity  # kg
         
         # 加氢时间 (分钟)
         self.fill_time_minutes = np.clip(
@@ -963,7 +971,8 @@ class FCEVDemandGenerator:
                 if hour_of_day in Config.peak_morning_hours or hour_of_day in Config.peak_evening_hours:
                     base_multiplier *= 1.1
         
-        return base_multiplier * np.random.uniform(0.6, 1.4)
+        # 略收窄随机幅度，减轻同策略下回合间利润尖刺（仍保留随机到达过程）
+        return base_multiplier * np.random.uniform(0.72, 1.28)
     
     def generate_vehicles(self, current_step):
         """
@@ -1007,54 +1016,54 @@ class FCEVDemandGenerator:
         else:
             tank_capacity = np.random.uniform(8.0, 10.0)  # 商用车
         
-        # 到站SOG (State of Gas) - 根据时段和车型调整
+        # 到站SOC (State of Charge (SOC) - 根据时段和车型调整
         if hour_of_day in Config.peak_morning_hours:
-            # 早高峰: 商用车开始一天工作，SOG中等
-            sog_mean = 0.35
-            sog_std = 0.12
+            # 早高峰: 商用车开始一天工作，SOC中等
+            soc_mean = 0.35
+            soc_std = 0.12
         elif hour_of_day in Config.peak_evening_hours:
-            # 晚高峰: 商用车结束工作，SOG较低
-            sog_mean = 0.18
-            sog_std = 0.08
+            # 晚高峰: 商用车结束工作，SOC较低
+            soc_mean = 0.18
+            soc_std = 0.08
         elif 10 <= hour_of_day <= 16:
-            # 白天: 中途补充，SOG中等偏低
-            sog_mean = 0.25
-            sog_std = 0.10
+            # 白天: 中途补充，SOC中等偏低
+            soc_mean = 0.25
+            soc_std = 0.10
         else:
             # 其他时段
-            sog_mean = Config.fcev_sog_arrival_mean
-            sog_std = Config.fcev_sog_arrival_std
+            soc_mean = Config.fcev_soc_arrival_mean
+            soc_std = Config.fcev_soc_arrival_std
         
-        # 商用车SOG普遍更低 (使用强度大)
+        # 商用车SOC普遍更低 (使用强度大)
         if tank_capacity > 7.0:  # 商用车
-            sog_mean *= 0.8
+            soc_mean *= 0.8
         
-        sog_initial = np.clip(
-            np.random.normal(sog_mean, sog_std),
+        soc_initial = np.clip(
+            np.random.normal(soc_mean, soc_std),
             0.05, 0.50
         )
         
-        # 目标SOG (商用车倾向充更满)
+        # 目标SOC (商用车倾向充更满)
         if tank_capacity > 7.0:
-            sog_target = 0.98  # 商用车充到98%
+            soc_target = 0.98  # 商用车充到98%
         else:
-            sog_target = Config.fcev_sog_target  # 乘用车95%
+            soc_target = Config.fcev_soc_target  # 乘用车95%
         
         # 350-bar 车型比例 (公交/卡车)
         target_pressure = 350 if np.random.random() < Config.fcev_350bar_ratio else 700
         
         return FCEVehicle(
             vehicle_id, arrival_time, tank_capacity,
-            sog_initial, sog_target, target_pressure
+            soc_initial, soc_target, target_pressure
         )
 
 
 class FCEVServiceStation:
     """
     FCEV加氢服务站 (统一 Low→High 差压级联协议)
-    - 350-bar HDV: T3₁→T3₂ 级联直充 (低压优先, SOG 门控)
+    - 350-bar HDV: T3₁→T3₂ 级联直充 (低压优先, SOC 门控)
     - 700-bar LDV: T3₁→T3₂→T3₃ 级联直充 + T3₃→C3→700 bar 增压末段
-    - 分别追踪两类车型的平均 SOG, 用于差压级联和 APC 计算
+    - 分别追踪两类车型的平均 SOC, 用于差压级联和 APC 计算
     """
     def __init__(self):
         self.fcev_dispensers = Config.max_concurrent_fcev
@@ -1066,8 +1075,8 @@ class FCEVServiceStation:
         self.total_fcev_revenue = 0.0
         self.total_vehicles_delayed = 0
         
-        self.current_fcev_350_avg_sog = 0.2
-        self.current_fcev_700_avg_sog = 0.2
+        self.current_fcev_350_avg_soc = 0.2
+        self.current_fcev_700_avg_soc = 0.2
     
     def add_vehicles(self, fcev_list):
         self.fcev_queue.extend(fcev_list)
@@ -1094,15 +1103,15 @@ class FCEVServiceStation:
         h2_demand_350, h2_demand_700, revenue, penalty = \
             self._serve_fcev_queue(h2_available_350, h2_available_700, dt)
         
-        # 更新两类车型的平均 SOG (用于差压级联门控和 C3 APC)
-        for tp, attr in [(350, 'current_fcev_350_avg_sog'), (700, 'current_fcev_700_avg_sog')]:
+        # 更新两类车型的平均 SOC (用于差压级联门控和 C3 APC)
+        for tp, attr in [(350, 'current_fcev_350_avg_soc'), (700, 'current_fcev_700_avg_soc')]:
             serving = [v for v in self.fcev_being_served if v.target_pressure == tp]
             queued  = [v for v in self.fcev_queue if v.target_pressure == tp]
             if serving:
-                setattr(self, attr, sum(v.sog_initial for v in serving) / len(serving))
+                setattr(self, attr, sum(v.soc_initial for v in serving) / len(serving))
             elif queued:
                 sample = queued[:3]
-                setattr(self, attr, sum(v.sog_initial for v in sample) / len(sample))
+                setattr(self, attr, sum(v.soc_initial for v in sample) / len(sample))
             else:
                 setattr(self, attr, 0.2)
         

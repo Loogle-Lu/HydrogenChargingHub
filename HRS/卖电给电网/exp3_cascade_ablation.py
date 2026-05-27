@@ -102,7 +102,7 @@ class NaiveArchEnv(HydrogenEnv):
         """覆写：朴素架构功耗计算（物理 H₂ 流量与父类相同，仅功耗不同）。"""
         t1_soc = self.storage.t1.get_soc()
         t2_soc = self.storage.t2.get_soc()
-        avg_fcev_sog = self.service_station.current_fcev_avg_sog  # noqa: F841
+        avg_fcev_soc = self.service_station.current_fcev_avg_soc  # noqa: F841
 
         # ---- 流量计算（与 smart 相同，物理上不变） ----
         c1_flow_base = h2_produced * min(1.0, max(0.5, t1_soc))

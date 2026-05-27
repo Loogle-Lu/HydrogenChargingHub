@@ -17,7 +17,7 @@
   + 固定控制 → 温控不稳 → SAE J2601 合规性降低 → 保守充装 → 有效吞吐降低
 
 输出:
-- 图: Reward/Profit 柱状图(含误差棒) | Reward/Profit 曲线 | Compressor/Chiller/Bypass 指标
+- Figure_2_exp2_reward_profit.png: 1×2 — Reward / Profit 训练曲线（20 episode 滑动平均）
 """
 
 import numpy as np
@@ -33,7 +33,7 @@ from config import Config
 
 # ======================== 配置 ========================
 NUM_RUNS = 1  # 增加 run 数以计算误差棒
-NUM_EPISODES = 200  # 6D 搜索空间，需要足够步骤收敛
+NUM_EPISODES = 500  # 6D 搜索空间，需要足够步骤收敛
 WARMUP_STEPS = 400
 BATCH_SIZE = 256
 LR = 3e-4
@@ -93,12 +93,12 @@ def moving_average(data, window):
 def train_sac_full_6d(num_episodes, num_runs):
     """
     SAC 完整 6 维动作 (含压缩机智能控制)
-    返回: (all_rewards, all_profits, all_comp_energy, all_chiller_energy, all_bypass)
+    返回: (all_rewards, all_profits, all_comp_energy, all_chiller_energy, all_bypass, all_c3_energy)
     均为 shape (num_runs, num_episodes)
     """
     dt = Config.dt
     all_rewards, all_profits = [], []
-    all_comp_energy, all_chiller_energy, all_bypass = [], [], []
+    all_comp_energy, all_chiller_energy, all_bypass, all_c3_energy = [], [], [], []
     for run in range(num_runs):
         set_seed(42 + run)
         env = HydrogenEnv(enable_i2s_constraint=True)
@@ -108,13 +108,13 @@ def train_sac_full_6d(num_episodes, num_runs):
         replay_buffer = ReplayBuffer(capacity=100000)
 
         run_rewards, run_profits = [], []
-        run_comp, run_chiller, run_bypass = [], [], []
+        run_comp, run_chiller, run_bypass, run_c3 = [], [], [], []
         total_steps = 0
 
         for ep in range(num_episodes):
             state = env.reset()
             ep_reward, ep_profit = 0.0, 0.0
-            ep_comp_kwh, ep_chiller_kwh = 0.0, 0.0
+            ep_comp_kwh, ep_chiller_kwh, ep_c3_kwh = 0.0, 0.0, 0.0
             done = False
 
             while not done:
@@ -134,6 +134,7 @@ def train_sac_full_6d(num_episodes, num_runs):
                 ep_profit += info.get("profit", 0.0)
                 ep_comp_kwh += info.get("comp_power", 0.0) * dt
                 ep_chiller_kwh += info.get("chiller_power", 0.0) * dt
+                ep_c3_kwh += info.get("comp_c3_power", 0.0) * dt
                 total_steps += 1
 
             bp = info.get("bypass_activations", {"c1": 0, "c2": 0, "c3": 0})
@@ -144,25 +145,34 @@ def train_sac_full_6d(num_episodes, num_runs):
             run_comp.append(ep_comp_kwh)
             run_chiller.append(ep_chiller_kwh)
             run_bypass.append(ep_bypass)
+            run_c3.append(ep_c3_kwh)
 
         all_rewards.append(run_rewards)
         all_profits.append(run_profits)
         all_comp_energy.append(run_comp)
         all_chiller_energy.append(run_chiller)
         all_bypass.append(run_bypass)
+        all_c3_energy.append(run_c3)
 
     arr = lambda x: np.array(x)
-    return arr(all_rewards), arr(all_profits), arr(all_comp_energy), arr(all_chiller_energy), arr(all_bypass)
+    return (
+        arr(all_rewards),
+        arr(all_profits),
+        arr(all_comp_energy),
+        arr(all_chiller_energy),
+        arr(all_bypass),
+        arr(all_c3_energy),
+    )
 
 
 def train_sac_fixed_compressor_2d(num_episodes, num_runs):
     """
     SAC 固定压缩机 (2 维有效动作: ele, fc)
-    返回: (all_rewards, all_profits, all_comp_energy, all_chiller_energy, all_bypass)
+    返回: (all_rewards, all_profits, all_comp_energy, all_chiller_energy, all_bypass, all_c3_energy)
     """
     dt = Config.dt
     all_rewards, all_profits = [], []
-    all_comp_energy, all_chiller_energy, all_bypass = [], [], []
+    all_comp_energy, all_chiller_energy, all_bypass, all_c3_energy = [], [], [], []
     for run in range(num_runs):
         set_seed(42 + run)
         env_raw = HydrogenEnv(enable_i2s_constraint=True)
@@ -174,13 +184,13 @@ def train_sac_fixed_compressor_2d(num_episodes, num_runs):
         replay_buffer = ReplayBuffer(capacity=100000)
 
         run_rewards, run_profits = [], []
-        run_comp, run_chiller, run_bypass = [], [], []
+        run_comp, run_chiller, run_bypass, run_c3 = [], [], [], []
         total_steps = 0
 
         for ep in range(num_episodes):
             state = env.reset()
             ep_reward, ep_profit = 0.0, 0.0
-            ep_comp_kwh, ep_chiller_kwh = 0.0, 0.0
+            ep_comp_kwh, ep_chiller_kwh, ep_c3_kwh = 0.0, 0.0, 0.0
             done = False
 
             while not done:
@@ -200,6 +210,7 @@ def train_sac_fixed_compressor_2d(num_episodes, num_runs):
                 ep_profit += info.get("profit", 0.0)
                 ep_comp_kwh += info.get("comp_power", 0.0) * dt
                 ep_chiller_kwh += info.get("chiller_power", 0.0) * dt
+                ep_c3_kwh += info.get("comp_c3_power", 0.0) * dt
                 total_steps += 1
 
             bp = info.get("bypass_activations", {"c1": 0, "c2": 0, "c3": 0})
@@ -210,15 +221,24 @@ def train_sac_fixed_compressor_2d(num_episodes, num_runs):
             run_comp.append(ep_comp_kwh)
             run_chiller.append(ep_chiller_kwh)
             run_bypass.append(ep_bypass)
+            run_c3.append(ep_c3_kwh)
 
         all_rewards.append(run_rewards)
         all_profits.append(run_profits)
         all_comp_energy.append(run_comp)
         all_chiller_energy.append(run_chiller)
         all_bypass.append(run_bypass)
+        all_c3_energy.append(run_c3)
 
     arr = lambda x: np.array(x)
-    return arr(all_rewards), arr(all_profits), arr(all_comp_energy), arr(all_chiller_energy), arr(all_bypass)
+    return (
+        arr(all_rewards),
+        arr(all_profits),
+        arr(all_comp_energy),
+        arr(all_chiller_energy),
+        arr(all_bypass),
+        arr(all_c3_energy),
+    )
 
 
 def _last20_mean_std(arr):
@@ -239,12 +259,16 @@ def main():
     print("=" * 60)
 
     print("\n[1/2] Training SAC Full 6D (compressor intelligent control)...")
-    r_full, p_full, c_full, ch_full, bp_full = train_sac_full_6d(NUM_EPISODES, NUM_RUNS)
+    r_full, p_full, c_full, ch_full, bp_full, c3_full = train_sac_full_6d(
+        NUM_EPISODES, NUM_RUNS
+    )
     rewards_full = np.mean(r_full, axis=0)
     profits_full = np.mean(p_full, axis=0)
 
     print("\n[2/2] Training SAC Naive Max Power 2D (no compressor intelligence)...")
-    r_fix, p_fix, c_fix, ch_fix, bp_fix = train_sac_fixed_compressor_2d(NUM_EPISODES, NUM_RUNS)
+    r_fix, p_fix, c_fix, ch_fix, bp_fix, c3_fix = train_sac_fixed_compressor_2d(
+        NUM_EPISODES, NUM_RUNS
+    )
     rewards_fixed = np.mean(r_fix, axis=0)
     profits_fixed = np.mean(p_fix, axis=0)
 
@@ -259,11 +283,13 @@ def main():
     ch_fix_m, ch_fix_s = _last20_mean_std(ch_fix)
     bp_full_m, bp_full_s = _last20_mean_std(bp_full)
     bp_fix_m, bp_fix_s = _last20_mean_std(bp_fix)
+    c3_full_m, c3_full_s = _last20_mean_std(c3_full)
+    c3_fix_m, c3_fix_s = _last20_mean_std(c3_fix)
 
     print(f"\n  Full 6D:          Reward={r_full_m:.2f}±{r_full_s:.2f}, Profit=${p_full_m:.0f}±{p_full_s:.0f}, "
-          f"Comp={c_full_m:.0f}kWh, Chiller={ch_full_m:.1f}kWh, Bypass={bp_full_m:.1f}")
+          f"Comp={c_full_m:.0f}kWh, DI/Chiller={ch_full_m:.1f}kWh, Bypass={bp_full_m:.1f}, C3={c3_full_m:.1f}kWh")
     print(f"  Naive Max Power: Reward={r_fix_m:.2f}±{r_fix_s:.2f}, Profit=${p_fix_m:.0f}±{p_fix_s:.0f}, "
-          f"Comp={c_fix_m:.0f}kWh, Chiller={ch_fix_m:.1f}kWh, Bypass={bp_fix_m:.1f}")
+          f"Comp={c_fix_m:.0f}kWh, DI/Chiller={ch_fix_m:.1f}kWh, Bypass={bp_fix_m:.1f}, C3={c3_fix_m:.1f}kWh")
     if p_fix_m != 0:
         profit_gain = (p_full_m - p_fix_m) / abs(p_fix_m) * 100
         print(f"\n  Profit improvement (6D vs Naive): {profit_gain:+.1f}%")
@@ -271,97 +297,44 @@ def main():
         comp_saving = (c_fix_m - c_full_m) / c_fix_m * 100
         print(f"  Compressor energy saving (6D vs Naive): {comp_saving:+.1f}%")
 
-    # ========== 绘图 2×3 ==========
+    # ========== 绘图：仅 Reward / Profit 训练曲线（1×2）==========
     plt.rcParams["axes.unicode_minus"] = False
     plt.rcParams["font.size"] = 9
-    fig, axs = plt.subplots(2, 3, figsize=(14, 9), constrained_layout=True)
-    fig.suptitle("Exp2: Action Space Ablation — Full 6D vs Naive Max Power 2D\n"
-                 "(Compressor Intelligent Control Contribution)",
-                 fontsize=11, fontweight="bold")
 
-    names = ["Full 6D", "Naive Max Power 2D"]
     colors = ["#1f77b4", "#ff7f0e"]
-    x = np.arange(2)
-    width = 0.5
+    fig, axs = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    fig.suptitle(
+        "Exp2: Action Ablation — Full 6D vs Naive 2D (Moving Average)",
+        fontsize=11,
+        fontweight="bold",
+    )
 
-    # (a) Reward 柱状图 + 误差棒
-    axs[0, 0].bar(x, [r_full_m, r_fix_m], width, yerr=[r_full_s, r_fix_s], color=colors,
-                  edgecolor="gray", linewidth=0.5, capsize=4, error_kw={"elinewidth": 1.5})
-    axs[0, 0].set_xticks(x)
-    axs[0, 0].set_xticklabels(names)
-    axs[0, 0].set_ylabel("Avg Reward (Last 20 Ep)")
-    axs[0, 0].set_title("(a) Reward")
-    axs[0, 0].grid(True, axis="y", alpha=0.3, linestyle="--")
-    for i, (m, s) in enumerate([(r_full_m, r_full_s), (r_fix_m, r_fix_s)]):
-        axs[0, 0].text(i, m + s + 0.3, f"{m:.1f}±{s:.1f}", ha="center", va="bottom", fontsize=8)
+    ep_range = np.arange(MA_WINDOW - 1, len(rewards_full))
+    axs[0].plot(ep_range, moving_average(rewards_full, MA_WINDOW), color=colors[0],
+                 linewidth=2, label="Full 6D")
+    axs[0].plot(ep_range, moving_average(rewards_fixed, MA_WINDOW), color=colors[1],
+                 linewidth=2, label="Naive 2D")
+    axs[0].set_xlabel("Episode")
+    axs[0].set_ylabel("Reward (scaled)")
+    axs[0].set_title("(a) Reward")
+    axs[0].legend(loc="best", fontsize=8)
+    axs[0].grid(True, alpha=0.3, linestyle="--")
 
-    # (b) Profit 柱状图 + 误差棒
-    axs[0, 1].bar(x, [p_full_m, p_fix_m], width, yerr=[p_full_s, p_fix_s], color=colors,
-                  edgecolor="gray", linewidth=0.5, capsize=4, error_kw={"elinewidth": 1.5})
-    axs[0, 1].set_xticks(x)
-    axs[0, 1].set_xticklabels(names)
-    axs[0, 1].set_ylabel("Avg Profit (Last 20 Ep, $)")
-    axs[0, 1].set_title("(b) Profit")
-    axs[0, 1].grid(True, axis="y", alpha=0.3, linestyle="--")
-    for i, (m, s) in enumerate([(p_full_m, p_full_s), (p_fix_m, p_fix_s)]):
-        axs[0, 1].text(i, m + s + 20, f"${m:.0f}±{s:.0f}", ha="center", va="bottom", fontsize=8)
+    axs[1].plot(ep_range, moving_average(profits_full, MA_WINDOW), color=colors[0],
+                 linewidth=2, label="Full 6D")
+    axs[1].plot(ep_range, moving_average(profits_fixed, MA_WINDOW), color=colors[1],
+                 linewidth=2, label="Naive 2D")
+    axs[1].set_xlabel("Episode")
+    axs[1].set_ylabel("Profit ($)")
+    axs[1].set_title("(b) Profit")
+    axs[1].legend(loc="best", fontsize=8)
+    axs[1].grid(True, alpha=0.3, linestyle="--")
 
-    # (c) Compressor Energy 柱状图 + 误差棒 (kWh/episode)
-    axs[0, 2].bar(x, [c_full_m, c_fix_m], width, yerr=[c_full_s, c_fix_s], color=colors,
-                  edgecolor="gray", linewidth=0.5, capsize=4, error_kw={"elinewidth": 1.5})
-    axs[0, 2].set_xticks(x)
-    axs[0, 2].set_xticklabels(names)
-    axs[0, 2].set_ylabel("Compressor Energy (kWh/Ep)")
-    axs[0, 2].set_title("(c) Compressor Energy (Lower=Better)")
-    axs[0, 2].grid(True, axis="y", alpha=0.3, linestyle="--")
-    for i, (m, s) in enumerate([(c_full_m, c_full_s), (c_fix_m, c_fix_s)]):
-        axs[0, 2].text(i, m + s + 5, f"{m:.0f}±{s:.0f}", ha="center", va="bottom", fontsize=8)
+    out_name = "Figure_2_exp2_reward_profit.png"
+    plt.savefig(out_name, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
-    # (d) Chiller Energy 柱状图 + 误差棒
-    axs[1, 0].bar(x, [ch_full_m, ch_fix_m], width, yerr=[ch_full_s, ch_fix_s], color=colors,
-                  edgecolor="gray", linewidth=0.5, capsize=4, error_kw={"elinewidth": 1.5})
-    axs[1, 0].set_xticks(x)
-    axs[1, 0].set_xticklabels(names)
-    axs[1, 0].set_ylabel("Chiller Energy (kWh/Ep)")
-    axs[1, 0].set_title("(d) Chiller Energy (Lower=Better)")
-    axs[1, 0].grid(True, axis="y", alpha=0.3, linestyle="--")
-    for i, (m, s) in enumerate([(ch_full_m, ch_full_s), (ch_fix_m, ch_fix_s)]):
-        axs[1, 0].text(i, m + s + 2, f"{m:.1f}±{s:.1f}", ha="center", va="bottom", fontsize=8)
-
-    # (e) Bypass Activations 柱状图 + 误差棒
-    axs[1, 1].bar(x, [bp_full_m, bp_fix_m], width, yerr=[bp_full_s, bp_fix_s], color=colors,
-                  edgecolor="gray", linewidth=0.5, capsize=4, error_kw={"elinewidth": 1.5})
-    axs[1, 1].set_xticks(x)
-    axs[1, 1].set_xticklabels(names)
-    axs[1, 1].set_ylabel("Avg Bypass/Ep (Last 20)")
-    axs[1, 1].set_title("(e) Bypass Activations (Higher=More Energy Saved)")
-    axs[1, 1].grid(True, axis="y", alpha=0.3, linestyle="--")
-    for i, (m, s) in enumerate([(bp_full_m, bp_full_s), (bp_fix_m, bp_fix_s)]):
-        axs[1, 1].text(i, m + s + 1, f"{m:.1f}±{s:.1f}", ha="center", va="bottom", fontsize=8)
-
-    # (f) Reward 与 Profit 曲线
-    ep_range = range(MA_WINDOW - 1, len(rewards_full))
-    axs[1, 2].plot(ep_range, moving_average(rewards_full, MA_WINDOW), color=colors[0],
-                   linewidth=2, label="Reward (Full 6D)")
-    axs[1, 2].plot(ep_range, moving_average(rewards_fixed, MA_WINDOW), color=colors[1],
-                   linewidth=2, label="Reward (Fixed 2D)")
-    ax2 = axs[1, 2].twinx()
-    ax2.plot(ep_range, moving_average(profits_full, MA_WINDOW), color=colors[0],
-             linewidth=1.5, linestyle="--", alpha=0.8, label="Profit (Full 6D)")
-    ax2.plot(ep_range, moving_average(profits_fixed, MA_WINDOW), color=colors[1],
-             linewidth=1.5, linestyle="--", alpha=0.8, label="Profit (Fixed 2D)")
-    axs[1, 2].set_xlabel("Episode")
-    axs[1, 2].set_ylabel("Reward", color="black")
-    ax2.set_ylabel("Profit ($)", color="gray")
-    axs[1, 2].set_title("(f) Reward & Profit Curves (MA{})".format(MA_WINDOW))
-    axs[1, 2].legend(loc="upper left", fontsize=7)
-    ax2.legend(loc="center right", fontsize=7)
-    axs[1, 2].grid(True, alpha=0.3, linestyle="--")
-
-    savename = "Figure_2_exp2_7D_vs_NaiveMaxPower.png"
-    plt.savefig(savename, dpi=150, bbox_inches="tight")
-    plt.show()
-    print(f"\nFigure saved: {savename}")
+    print(f"\nFigure saved:  {out_name}")
 
 
 if __name__ == "__main__":

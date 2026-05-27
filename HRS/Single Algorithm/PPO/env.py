@@ -101,8 +101,8 @@ class HydrogenEnv(gym.Env):
                            self.storage.t3_3.max_pressure * self.storage.t3_3.get_soc()) / 3.0
         t4_pressure = self.storage.t4.max_pressure * self.storage.t4.get_soc()
         
-        # 获取当前FCEV平均SOG (用于自适应压力控制)
-        avg_fcev_sog = self.service_station.current_fcev_avg_sog
+        # 获取当前FCEV平均SOC (用于自适应压力控制)
+        avg_fcev_soc = self.service_station.current_fcev_avg_soc
         
         # C1流量: 基于T1 SOC自适应
         c1_flow = h2_produced * min(1.0, max(0.5, t1_soc))
@@ -125,7 +125,7 @@ class HydrogenEnv(gym.Env):
         c3_flow = fcev_h2_demand * 0.3  # 30%通过C3超高压
         c3_power, c3_heat = self.comp_system.compute_c3(
             c3_flow,
-            avg_fcev_sog=avg_fcev_sog,
+            avg_fcev_soc=avg_fcev_soc,
             tank_pressure=t4_pressure,
             electricity_price=price
         )
